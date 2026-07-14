@@ -197,6 +197,8 @@ paths:
         Один запрос на загрузку карты на первом экране.
       operationId: getMap
       security: []
+      parameters:
+        - $ref: '#/components/parameters/IsTemporary'
       responses:
         '200':
           description: Дерево залов и витрин.
@@ -215,6 +217,7 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/IsTemporary'
       responses:
         '200':
           description: Список залов.
@@ -411,6 +414,7 @@ paths:
           schema:
             type: string
           example: яйцо
+        - $ref: '#/components/parameters/IsTemporary'
       responses:
         '200':
           description: Список экспонатов.
@@ -1390,6 +1394,17 @@ components:
         type: integer
         minimum: 0
         default: 0
+    IsTemporary:
+      name: is_temporary
+      in: query
+      required: false
+      description: >-
+        Фильтр по типу экспозиции: `true` — временные (сменные) выставки,
+        `false` — основная (постоянная) экспозиция. Без параметра возвращаются
+        и те и другие. Для экспонатов признак берётся от зала (через витрину).
+      schema:
+        type: boolean
+      example: true
     HallId:
       name: hall_id
       in: path
@@ -1557,6 +1572,14 @@ components:
           format: uri
           nullable: true
           example: https://cdn.example.cloud/halls/blue/cover.jpg
+        is_temporary:
+          type: boolean
+          default: false
+          description: >-
+            Зал временной (сменной) выставки. `true` — временная выставка,
+            `false` — основная (постоянная) экспозиция. Основа для тега/фильтра
+            «Временная выставка» в каталоге и переключателя в админке.
+          example: false
         showcase_count:
           type: integer
           nullable: true
@@ -1762,6 +1785,14 @@ components:
           type: integer
           nullable: true
           example: 12
+        is_temporary:
+          type: boolean
+          nullable: true
+          description: >-
+            Признак временной выставки, унаследованный от зала экспоната
+            (через витрину → зал). Позволяет показать бейдж «Временная выставка»
+            в карточке каталога.
+          example: false
 
     Exhibit:
       type: object
@@ -2177,6 +2208,11 @@ components:
           type: integer
           nullable: true
           example: 2
+        is_temporary:
+          type: boolean
+          default: false
+          description: Отметить зал как временную выставку (переключатель в админке).
+          example: false
 
     HallPatch:
       type: object
@@ -2202,6 +2238,11 @@ components:
           format: uri
           nullable: true
           example: https://cdn.example.cloud/halls/blue/cover.jpg
+        is_temporary:
+          type: boolean
+          nullable: true
+          description: Переключатель «Временная выставка» для зала.
+          example: true
 
     LoginRequest:
       type: object

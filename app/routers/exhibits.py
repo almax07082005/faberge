@@ -21,9 +21,12 @@ async def list_exhibits(
     showcase_id: Optional[int] = Query(None, ge=1),
     label_slug: Optional[str] = Query(None),
     q: Optional[str] = Query(None),
+    is_temporary: Optional[bool] = Query(
+        None, description="Фильтр по типу зала экспоната: true — временная выставка, false — основная экспозиция."
+    ),
     session: AsyncSession = Depends(get_session),
 ) -> sch.ExhibitListResponse:
-    return await crud.list_exhibits(session, p.limit, p.offset, hall_id, showcase_id, label_slug, q)
+    return await crud.list_exhibits(session, p.limit, p.offset, hall_id, showcase_id, label_slug, q, is_temporary)
 
 
 @router.get("/exhibits/by-slug/{label_slug}", response_model=sch.Exhibit, summary="Экспонат по label_slug")

@@ -26,6 +26,7 @@ class Hall(BaseModel):
     description: Optional[str] = None
     level: Optional[int] = None
     cover_image_url: Optional[str] = None
+    is_temporary: bool = False            # зал временной выставки (vs основная экспозиция)
     showcase_count: Optional[int] = None
     exhibit_count: Optional[int] = None
 
@@ -104,6 +105,7 @@ class ExhibitSummary(BaseModel):
     thumbnail_url: Optional[str] = None
     hall_id: Optional[int] = None
     showcase_id: Optional[int] = None
+    is_temporary: Optional[bool] = None  # унаследовано от зала: экспонат временной выставки
 
 
 class Exhibit(BaseModel):
@@ -257,6 +259,7 @@ class HallCreate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
     level: Optional[int] = None
+    is_temporary: bool = False
 
 
 class HallPatch(BaseModel):
@@ -265,6 +268,7 @@ class HallPatch(BaseModel):
     description: Optional[str] = None
     level: Optional[int] = None
     cover_image_url: Optional[str] = None
+    is_temporary: Optional[bool] = None
 
 
 class LoginRequest(BaseModel):

@@ -8,25 +8,26 @@
 BEGIN;
 
 -- Залы -----------------------------------------------------------------------
-INSERT INTO halls (id, hall_number, name, description, level, cover_image_url) VALUES
+-- is_temporary=true — зал временной (сменной) выставки; остальные — основная экспозиция.
+INSERT INTO halls (id, hall_number, name, description, level, cover_image_url, is_temporary) VALUES
  (1, 1, 'Рыцарский зал',
      'Парадный зал Шуваловского дворца с витринами портсигаров, рамок и предметов с эмалью.', 2,
-     'https://cdn.example.cloud/halls/knights/cover.jpg'),
+     'https://cdn.example.cloud/halls/knights/cover.jpg', false),
  (2, 2, 'Красная гостиная',
      'Гостиная с камнерезными миниатюрами и анималистическими фигурками фирмы Фаберже.', 2,
-     'https://cdn.example.cloud/halls/red/cover.jpg'),
+     'https://cdn.example.cloud/halls/red/cover.jpg', false),
  (3, 3, 'Синяя гостиная',
      'Главный зал коллекции: здесь представлены императорские пасхальные яйца Фаберже.', 2,
-     'https://cdn.example.cloud/halls/blue/cover.jpg'),
+     'https://cdn.example.cloud/halls/blue/cover.jpg', false),
  (4, 4, 'Золотая гостиная',
      'Зал с цветочными этюдами и кабинетными драгоценностями.', 2,
-     'https://cdn.example.cloud/halls/gold/cover.jpg'),
+     'https://cdn.example.cloud/halls/gold/cover.jpg', false),
  (5, 5, 'Выставочный зал',
      'Пространство сменных тематических экспозиций музея.', 1,
-     'https://cdn.example.cloud/halls/expo/cover.jpg'),
+     'https://cdn.example.cloud/halls/expo/cover.jpg', true),
  (6, 6, 'Готическая комната',
      'Камерный зал с произведениями эмальерного искусства.', 2,
-     'https://cdn.example.cloud/halls/gothic/cover.jpg')
+     'https://cdn.example.cloud/halls/gothic/cover.jpg', false)
 ON CONFLICT (id) DO NOTHING;
 
 -- Витрины --------------------------------------------------------------------
@@ -102,6 +103,13 @@ INSERT INTO exhibits
    'Этюд незабудок в вазочке с «водой» из горного хрусталя.',
    'Фирма Фаберже. Около 1910 года. Сюжет — букетик незабудок. Материалы — золото, синяя и зелёная эмаль, нефритовые листья, вазочка из горного хрусталя, имитирующего воду. Жанр — цветочный этюд.',
    'https://cdn.example.cloud/exhibits/forgetmenot/main.jpg', NULL,
+   'https://fabergemuseum.ru/kollekczii/shedevryi-kollekczii/'),
+ -- Экспонат сменной (временной) выставки — витрина 6 в зале 5 (is_temporary=true).
+ (140, 6, 'faberge_temp_brooch', 'Брошь «Весенние цветы» (временная выставка)', 1902, 'Фирма Фаберже',
+   'Золото, эмаль, демантоиды, бриллианты',
+   'Экспонат сменной тематической выставки: брошь в виде букета весенних цветов.',
+   'Фирма Фаберже. Около 1902 года. Показывается в рамках временной выставки. Материалы — золото, оконная эмаль, уральские демантоиды, бриллианты-розы. Жанр — ювелирная брошь.',
+   'https://cdn.example.cloud/exhibits/spring-brooch/main.jpg', NULL,
    'https://fabergemuseum.ru/kollekczii/shedevryi-kollekczii/')
 ON CONFLICT (id) DO NOTHING;
 

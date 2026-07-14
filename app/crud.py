@@ -21,6 +21,7 @@ def to_hall(h: m.Hall, showcase_count: Optional[int] = None, exhibit_count: Opti
         description=h.description,
         level=h.level,
         cover_image_url=h.cover_image_url,
+        is_temporary=h.is_temporary,
         showcase_count=showcase_count,
         exhibit_count=exhibit_count,
     )
@@ -37,7 +38,7 @@ def to_showcase(s: m.Showcase, exhibit_count: Optional[int] = None) -> sch.Showc
 
 
 def to_exhibit_summary(e: m.Exhibit) -> sch.ExhibitSummary:
-    hall_id = e.showcase.hall_id if e.showcase else None
+    hall = e.showcase.hall if e.showcase else None
     return sch.ExhibitSummary(
         id=e.id,
         label_slug=e.label_slug,
@@ -45,8 +46,9 @@ def to_exhibit_summary(e: m.Exhibit) -> sch.ExhibitSummary:
         year_created=e.year_created,
         master_name=e.master_name,
         thumbnail_url=e.image_url,
-        hall_id=hall_id,
+        hall_id=hall.id if hall else None,
         showcase_id=e.showcase_id,
+        is_temporary=hall.is_temporary if hall else None,
     )
 
 
@@ -98,7 +100,7 @@ _EXHIBIT_FULL = (
     selectinload(m.Exhibit.showcase).selectinload(m.Showcase.hall),
     selectinload(m.Exhibit.images),
 )
-_EXHIBIT_SUMMARY = (selectinload(m.Exhibit.showcase),)
+_EXHIBIT_SUMMARY = (selectinload(m.Exhibit.showcase).selectinload(m.Showcase.hall),)
 
 
 # ── Счётчики ─────────────────────────────────────────────────────────────────
@@ -131,12 +133,11 @@ async def _showcase_exhibit_counts(session: AsyncSession, showcase_ids: Sequence
 
 
 # ── Карта / навигация ────────────────────────────────────────────────────────
-async def get_map(session: AsyncSession) -> sch.MapResponse:
-    halls = (
-        (await session.execute(select(m.Hall).options(selectinload(m.Hall.showcases)).order_by(m.Hall.hall_number)))
-        .scalars()
-        .all()
-    )
+async def get_map(session: AsyncSession, is_temporary: Optional[bool] = None) -> sch.MapResponse:
+    stmt = select(m.Hall).options(selectinload(m.Hall.showcases)).order_by(m.Hall.hall_number)
+    if is_temporary is not None:
+        stmt = stmt.where(m.Hall.is_temporary == is_temporary)
+    halls = (await session.execute(stmt)).scalars().all()
     hall_ids = [h.id for h in halls]
     showcase_counts, exhibit_counts = await _hall_counts(session, hall_ids)
     all_showcase_ids = [s.id for h in halls for s in h.showcases]
@@ -154,20 +155,24 @@ async def get_map(session: AsyncSession) -> sch.MapResponse:
         map_halls.append(
             sch.MapHall(
                 id=h.id, hall_number=h.hall_number, name=h.name, description=h.description, level=h.level,
-                cover_image_url=h.cover_image_url, showcase_count=showcase_counts.get(h.id, 0),
+                cover_image_url=h.cover_image_url, is_temporary=h.is_temporary,
+                showcase_count=showcase_counts.get(h.id, 0),
                 exhibit_count=exhibit_counts.get(h.id, 0), showcases=showcases,
             )
         )
     return sch.MapResponse(halls=map_halls)
 
 
-async def list_halls(session: AsyncSession, limit: int, offset: int) -> sch.HallListResponse:
-    total = (await session.execute(select(func.count(m.Hall.id)))).scalar_one()
-    halls = (
-        (await session.execute(select(m.Hall).order_by(m.Hall.hall_number).limit(limit).offset(offset)))
-        .scalars()
-        .all()
-    )
+async def list_halls(
+    session: AsyncSession, limit: int, offset: int, is_temporary: Optional[bool] = None
+) -> sch.HallListResponse:
+    count_stmt = select(func.count(m.Hall.id))
+    list_stmt = select(m.Hall).order_by(m.Hall.hall_number)
+    if is_temporary is not None:
+        count_stmt = count_stmt.where(m.Hall.is_temporary == is_temporary)
+        list_stmt = list_stmt.where(m.Hall.is_temporary == is_temporary)
+    total = (await session.execute(count_stmt)).scalar_one()
+    halls = (await session.execute(list_stmt.limit(limit).offset(offset))).scalars().all()
     showcase_counts, exhibit_counts = await _hall_counts(session, [h.id for h in halls])
     items = [to_hall(h, showcase_counts.get(h.id, 0), exhibit_counts.get(h.id, 0)) for h in halls]
     return sch.HallListResponse(items=items, total=total, limit=limit, offset=offset)
@@ -184,7 +189,8 @@ async def get_hall(session: AsyncSession, hall_id: int) -> Optional[sch.HallDeta
     showcases = [to_showcase(s, sc_ex_counts.get(s.id, 0)) for s in hall.showcases]
     return sch.HallDetail(
         id=hall.id, hall_number=hall.hall_number, name=hall.name, description=hall.description, level=hall.level,
-        cover_image_url=hall.cover_image_url, showcase_count=showcase_counts.get(hall.id, 0),
+        cover_image_url=hall.cover_image_url, is_temporary=hall.is_temporary,
+        showcase_count=showcase_counts.get(hall.id, 0),
         exhibit_count=exhibit_counts.get(hall.id, 0), showcases=showcases,
     )
 
@@ -273,7 +279,7 @@ async def list_showcase_exhibits(session: AsyncSession, showcase_id: int, limit:
 
 async def list_exhibits(
     session: AsyncSession, limit: int, offset: int, hall_id: Optional[int], showcase_id: Optional[int],
-    label_slug: Optional[str], q: Optional[str],
+    label_slug: Optional[str], q: Optional[str], is_temporary: Optional[bool] = None,
 ) -> sch.ExhibitListResponse:
     conds = []
     if hall_id is not None:
@@ -284,6 +290,16 @@ async def list_exhibits(
         conds.append(m.Exhibit.label_slug == label_slug)
     if q:
         conds.append(m.Exhibit.name.ilike(f"%{q}%"))
+    if is_temporary is not None:
+        # Временность наследуется от зала: экспонат «временный», если его витрина
+        # принадлежит залу временной выставки (showcase → hall.is_temporary).
+        conds.append(
+            m.Exhibit.showcase_id.in_(
+                select(m.Showcase.id)
+                .join(m.Hall, m.Showcase.hall_id == m.Hall.id)
+                .where(m.Hall.is_temporary == is_temporary)
+            )
+        )
     flt = and_(*conds) if conds else (m.Exhibit.id == m.Exhibit.id)
     return await _exhibits_page(session, flt, limit, offset)
 
@@ -355,7 +371,10 @@ async def search(session: AsyncSession, q: str, limit: int) -> sch.SearchRespons
 
 # ── Администрирование (CRUD) ─────────────────────────────────────────────────
 async def create_hall(session: AsyncSession, data: sch.HallCreate) -> sch.HallDetail:
-    hall = m.Hall(hall_number=data.hall_number, name=data.name, description=data.description, level=data.level)
+    hall = m.Hall(
+        hall_number=data.hall_number, name=data.name, description=data.description,
+        level=data.level, is_temporary=data.is_temporary,
+    )
     session.add(hall)
     await session.commit()
     result = await get_hall(session, hall.id)
