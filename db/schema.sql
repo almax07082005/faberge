@@ -31,9 +31,15 @@ CREATE TABLE IF NOT EXISTS halls (
     description     TEXT,                       -- описание зала (план/путеводитель)
     level           INT,                        -- этаж/уровень в здании
     cover_image_url TEXT,
+    is_temporary    BOOLEAN NOT NULL DEFAULT false,  -- зал временной выставки (vs основная экспозиция)
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Идемпотентная миграция для уже существующих БД (CREATE TABLE IF NOT EXISTS выше
+-- не добавит колонку к таблице, созданной ранее). Повторный запуск init_db.py
+-- безопасен: столбец добавляется только при отсутствии.
+ALTER TABLE halls ADD COLUMN IF NOT EXISTS is_temporary BOOLEAN NOT NULL DEFAULT false;
 
 -- Витрины --------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS showcases (
@@ -113,6 +119,7 @@ CREATE INDEX IF NOT EXISTS idx_exhibit_images_exh   ON exhibit_images(exhibit_id
 CREATE INDEX IF NOT EXISTS idx_guide_messages_sess  ON guide_messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_type_ts       ON events(type, ts);
 CREATE INDEX IF NOT EXISTS idx_halls_name_trgm      ON halls    USING gin (name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_halls_is_temporary    ON halls(is_temporary);
 CREATE INDEX IF NOT EXISTS idx_exhibits_name_trgm   ON exhibits USING gin (name gin_trgm_ops);
 
 -- Триггеры updated_at --------------------------------------------------------

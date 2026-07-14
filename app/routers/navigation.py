@@ -15,13 +15,24 @@ router = APIRouter(tags=["Карта и навигация"])
 
 
 @router.get("/map", response_model=sch.MapResponse, summary="Интерактивная карта музея")
-async def get_map(session: AsyncSession = Depends(get_session)) -> sch.MapResponse:
-    return await crud.get_map(session)
+async def get_map(
+    is_temporary: Optional[bool] = Query(
+        None, description="Фильтр по типу зала: true — временные выставки, false — основная экспозиция."
+    ),
+    session: AsyncSession = Depends(get_session),
+) -> sch.MapResponse:
+    return await crud.get_map(session, is_temporary)
 
 
 @router.get("/halls", response_model=sch.HallListResponse, summary="Список залов")
-async def list_halls(p: Pagination = Depends(pagination), session: AsyncSession = Depends(get_session)) -> sch.HallListResponse:
-    return await crud.list_halls(session, p.limit, p.offset)
+async def list_halls(
+    p: Pagination = Depends(pagination),
+    is_temporary: Optional[bool] = Query(
+        None, description="Фильтр по типу зала: true — временные выставки, false — основная экспозиция."
+    ),
+    session: AsyncSession = Depends(get_session),
+) -> sch.HallListResponse:
+    return await crud.list_halls(session, p.limit, p.offset, is_temporary)
 
 
 @router.get("/halls/{hall_id}", response_model=sch.HallDetail, summary="Получить зал")
