@@ -1,10 +1,12 @@
 """Запросы к БД и сериализация ORM → Pydantic."""
 from __future__ import annotations
 
+import statistics
+from collections import Counter, defaultdict
 from datetime import date
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from sqlalchemy import String, and_, cast, delete as sa_delete, func, or_, select
+from sqlalchemy import String, and_, cast, delete as sa_delete, func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -22,6 +24,7 @@ def to_hall(h: m.Hall, showcase_count: Optional[int] = None, exhibit_count: Opti
         level=h.level,
         cover_image_url=h.cover_image_url,
         is_temporary=h.is_temporary,
+        sort_order=h.sort_order,
         showcase_count=showcase_count,
         exhibit_count=exhibit_count,
     )
@@ -79,6 +82,7 @@ def to_exhibit(e: m.Exhibit, admin: bool = False) -> sch.Exhibit:
     )
     if admin:
         data["raw_history"] = e.raw_history
+        data["short_description_spoken"] = e.short_description_spoken
     return cls(**data)
 
 
@@ -134,7 +138,7 @@ async def _showcase_exhibit_counts(session: AsyncSession, showcase_ids: Sequence
 
 # ── Карта / навигация ────────────────────────────────────────────────────────
 async def get_map(session: AsyncSession, is_temporary: Optional[bool] = None) -> sch.MapResponse:
-    stmt = select(m.Hall).options(selectinload(m.Hall.showcases)).order_by(m.Hall.hall_number)
+    stmt = select(m.Hall).options(selectinload(m.Hall.showcases)).order_by(m.Hall.sort_order, m.Hall.hall_number)
     if is_temporary is not None:
         stmt = stmt.where(m.Hall.is_temporary == is_temporary)
     halls = (await session.execute(stmt)).scalars().all()
@@ -155,7 +159,7 @@ async def get_map(session: AsyncSession, is_temporary: Optional[bool] = None) ->
         map_halls.append(
             sch.MapHall(
                 id=h.id, hall_number=h.hall_number, name=h.name, description=h.description, level=h.level,
-                cover_image_url=h.cover_image_url, is_temporary=h.is_temporary,
+                cover_image_url=h.cover_image_url, is_temporary=h.is_temporary, sort_order=h.sort_order,
                 showcase_count=showcase_counts.get(h.id, 0),
                 exhibit_count=exhibit_counts.get(h.id, 0), showcases=showcases,
             )
@@ -167,7 +171,7 @@ async def list_halls(
     session: AsyncSession, limit: int, offset: int, is_temporary: Optional[bool] = None
 ) -> sch.HallListResponse:
     count_stmt = select(func.count(m.Hall.id))
-    list_stmt = select(m.Hall).order_by(m.Hall.hall_number)
+    list_stmt = select(m.Hall).order_by(m.Hall.sort_order, m.Hall.hall_number)
     if is_temporary is not None:
         count_stmt = count_stmt.where(m.Hall.is_temporary == is_temporary)
         list_stmt = list_stmt.where(m.Hall.is_temporary == is_temporary)
@@ -189,7 +193,7 @@ async def get_hall(session: AsyncSession, hall_id: int) -> Optional[sch.HallDeta
     showcases = [to_showcase(s, sc_ex_counts.get(s.id, 0)) for s in hall.showcases]
     return sch.HallDetail(
         id=hall.id, hall_number=hall.hall_number, name=hall.name, description=hall.description, level=hall.level,
-        cover_image_url=hall.cover_image_url, is_temporary=hall.is_temporary,
+        cover_image_url=hall.cover_image_url, is_temporary=hall.is_temporary, sort_order=hall.sort_order,
         showcase_count=showcase_counts.get(hall.id, 0),
         exhibit_count=exhibit_counts.get(hall.id, 0), showcases=showcases,
     )
@@ -374,12 +378,51 @@ async def create_hall(session: AsyncSession, data: sch.HallCreate) -> sch.HallDe
     hall = m.Hall(
         hall_number=data.hall_number, name=data.name, description=data.description,
         level=data.level, is_temporary=data.is_temporary,
+        # По умолчанию порядок = номер зала (новый зал встаёт в конец естественного
+        # порядка); админ переставит через reorder / PATCH sort_order.
+        sort_order=data.sort_order if data.sort_order is not None else data.hall_number,
     )
     session.add(hall)
     await session.commit()
     result = await get_hall(session, hall.id)
     assert result is not None
     return result
+
+
+def _reorder_slots(current: Dict[int, int], hall_ids: List[int]) -> Dict[int, int]:
+    """Раздать «слоты» (отсортированные текущие sort_order) залам в новом порядке.
+
+    Чистая функция — вынесена для тестируемости. ``current`` — {hall_id: sort_order}
+    только для переставляемых залов; ``hall_ids`` — желаемый порядок. Возвращает
+    {hall_id: new_sort_order}.
+    """
+    slots = sorted(current.values())
+    return {hid: slot for hid, slot in zip(hall_ids, slots)}
+
+
+async def reorder_halls(session: AsyncSession, hall_ids: List[int]) -> None:
+    """Переставить залы (C11), сохраняя их текущие позиции (slot-preserving).
+
+    Берём переданные залы, их нынешние ``sort_order`` сортируем по возрастанию —
+    это «слоты». Раздаём слоты залам в порядке ``hall_ids``. Так перестановка
+    подсписка (напр. только основной экспозиции) не задевает позиции залов вне
+    запроса. Бросает ``ValueError`` при дубликатах или неизвестных id.
+    """
+    if len(set(hall_ids)) != len(hall_ids):
+        raise ValueError("Список hall_ids содержит дубликаты.")
+    rows = (
+        await session.execute(select(m.Hall.id, m.Hall.sort_order).where(m.Hall.id.in_(hall_ids)))
+    ).all()
+    current = {hid: so for hid, so in rows}
+    missing = [hid for hid in hall_ids if hid not in current]
+    if missing:
+        raise ValueError(f"Залы не найдены: {missing}")
+    for hid, new_order in _reorder_slots(current, hall_ids).items():
+        if current[hid] != new_order:
+            await session.execute(
+                sa_update(m.Hall).where(m.Hall.id == hid).values(sort_order=new_order)
+            )
+    await session.commit()
 
 
 async def get_hall_orm(session: AsyncSession, hall_id: int) -> Optional[m.Hall]:
@@ -588,6 +631,7 @@ async def analytics_overview(session: AsyncSession, dfrom: Optional[date], dto: 
         total_sessions_stmt = total_sessions_stmt.where(ev_range)
     total_sessions = (await session.execute(total_sessions_stmt)).scalar_one()
 
+    total_app_opens = await _count(m.Event.type == "app_open")
     total_recognitions = await _count(m.Event.type == "recognition")
     success = await _count(and_(m.Event.type == "recognition", cast(m.Event.props["recognized"].astext, String) == "true"))
     total_audio_plays = await _count(m.Event.type == "audio_play")
@@ -607,6 +651,7 @@ async def analytics_overview(session: AsyncSession, dfrom: Optional[date], dto: 
         from_=dfrom.isoformat() if dfrom else None,
         to=dto.isoformat() if dto else None,
         total_sessions=total_sessions,
+        total_app_opens=total_app_opens,
         total_recognitions=total_recognitions,
         recognition_success_rate=rate,
         total_chat_messages=total_chat_messages,
@@ -627,3 +672,176 @@ async def _top_items(session: AsyncSession, id_col, ev_type: str, entity, ev_ran
         name = (await session.execute(select(entity.name).where(entity.id == ent_id))).scalar_one_or_none()
         items.append(sch.AnalyticsTopItem(id=ent_id, name=name, count=count))
     return items
+
+
+async def _hall_names(session: AsyncSession, hall_ids: Set[int]) -> Dict[int, Optional[str]]:
+    if not hall_ids:
+        return {}
+    rows = await session.execute(select(m.Hall.id, m.Hall.name).where(m.Hall.id.in_(list(hall_ids))))
+    return {hid: name for hid, name in rows.all()}
+
+
+# ── C16: частые/редкие вопросы (агрегат по guide_messages) ────────────────────
+async def analytics_questions(
+    session: AsyncSession, dfrom: Optional[date], dto: Optional[date], limit: int = 20
+) -> sch.AnalyticsQuestions:
+    """Топ частых и редких вопросов посетителей.
+
+    Источник — реальные реплики пользователя (``guide_messages.role='user'``).
+    Формулировки нормализуем (trim + lower) и группируем, чтобы «Кто это?» и
+    «кто это? » считались одним вопросом.
+    """
+    norm = func.lower(func.trim(m.GuideMessage.content))
+    conds = [m.GuideMessage.role == "user", func.length(func.trim(m.GuideMessage.content)) > 0]
+    if dfrom is not None:
+        conds.append(m.GuideMessage.created_at >= dfrom)
+    if dto is not None:
+        conds.append(m.GuideMessage.created_at < dto)
+    where = and_(*conds)
+
+    grouped = select(norm.label("q"), func.count().label("c")).where(where).group_by(norm)
+    freq_rows = (await session.execute(grouped.order_by(func.count().desc(), norm).limit(limit))).all()
+    rare_rows = (await session.execute(grouped.order_by(func.count().asc(), norm).limit(limit))).all()
+
+    total = (await session.execute(select(func.count()).select_from(m.GuideMessage).where(where))).scalar_one()
+    unique = (await session.execute(select(func.count()).select_from(grouped.subquery()))).scalar_one()
+
+    return sch.AnalyticsQuestions(
+        from_=dfrom.isoformat() if dfrom else None,
+        to=dto.isoformat() if dto else None,
+        total_questions=total,
+        unique_questions=unique,
+        frequent=[sch.AnalyticsQuestionItem(question=q, count=c) for q, c in freq_rows],
+        rare=[sch.AnalyticsQuestionItem(question=q, count=c) for q, c in rare_rows],
+    )
+
+
+# ── C17: длительность сессии (первое открытие → последнее взаимодействие) ─────
+_DURATION_BUCKETS = [("0–1 мин", 0, 60), ("1–5 мин", 60, 300), ("5–15 мин", 300, 900), ("15+ мин", 900, None)]
+
+
+async def analytics_engagement(
+    session: AsyncSession, dfrom: Optional[date], dto: Optional[date]
+) -> sch.AnalyticsEngagement:
+    """Вовлечённость: время от первого события сессии до последнего.
+
+    ``first_open`` = MIN(ts) по сессии (обычно событие ``app_open``),
+    ``last_interaction`` = MAX(ts). Длительность = их разница. Считаем среднее,
+    медиану, максимум и распределение по корзинам — без спец. событий, только по
+    ``events`` (session_id + ts).
+    """
+    conds = [m.Event.session_id.isnot(None)]
+    if dfrom is not None:
+        conds.append(m.Event.ts >= dfrom)
+    if dto is not None:
+        conds.append(m.Event.ts < dto)
+    rows = (
+        await session.execute(
+            select(
+                m.Event.session_id,
+                func.min(m.Event.ts),
+                func.max(m.Event.ts),
+                func.count(),
+            )
+            .where(and_(*conds))
+            .group_by(m.Event.session_id)
+        )
+    ).all()
+
+    durations: List[float] = []
+    event_counts: List[int] = []
+    for _sid, first, last, n in rows:
+        durations.append((last - first).total_seconds())
+        event_counts.append(n)
+
+    total = len(rows)
+    buckets = [
+        sch.AnalyticsDurationBucket(
+            label=label,
+            count=sum(1 for d in durations if d >= lo and (hi is None or d < hi)),
+        )
+        for label, lo, hi in _DURATION_BUCKETS
+    ]
+    return sch.AnalyticsEngagement(
+        from_=dfrom.isoformat() if dfrom else None,
+        to=dto.isoformat() if dto else None,
+        total_sessions=total,
+        avg_duration_sec=round(statistics.fmean(durations), 1) if durations else 0.0,
+        median_duration_sec=round(statistics.median(durations), 1) if durations else 0.0,
+        max_duration_sec=round(max(durations), 1) if durations else 0.0,
+        avg_events_per_session=round(statistics.fmean(event_counts), 2) if event_counts else 0.0,
+        buckets=buckets,
+    )
+
+
+# ── C18: маршрут пользователя по залам (агрегат по hall_view) ─────────────────
+async def analytics_routes(
+    session: AsyncSession, dfrom: Optional[date], dto: Optional[date], limit: int = 10
+) -> sch.AnalyticsRoutes:
+    """Маршрут по залам: посещения, точки входа, переходы A→B, частые пути.
+
+    Строим последовательность залов на сессию из событий ``hall_view`` по ``ts``,
+    схлопывая подряд идущие повторы одного зала (переоткрытие карточек в том же
+    зале не считаем переходом).
+    """
+    conds = [m.Event.type == "hall_view", m.Event.hall_id.isnot(None), m.Event.session_id.isnot(None)]
+    if dfrom is not None:
+        conds.append(m.Event.ts >= dfrom)
+    if dto is not None:
+        conds.append(m.Event.ts < dto)
+    rows = (
+        await session.execute(
+            select(m.Event.session_id, m.Event.hall_id)
+            .where(and_(*conds))
+            .order_by(m.Event.session_id, m.Event.ts)
+        )
+    ).all()
+
+    sequences: Dict[object, List[int]] = defaultdict(list)
+    for sid, hid in rows:
+        seq = sequences[sid]
+        if not seq or seq[-1] != hid:  # схлопываем подряд идущие дубли
+            seq.append(hid)
+
+    visits: Counter = Counter()
+    entries: Counter = Counter()
+    transitions: Counter = Counter()
+    paths: Counter = Counter()
+    lengths: List[int] = []
+    for seq in sequences.values():
+        if not seq:
+            continue
+        lengths.append(len(seq))
+        entries[seq[0]] += 1
+        visits.update(seq)
+        transitions.update(zip(seq, seq[1:]))
+        paths[tuple(seq)] += 1
+
+    all_ids: Set[int] = set(visits)
+    for a, b in transitions:
+        all_ids.add(a)
+        all_ids.add(b)
+    names = await _hall_names(session, all_ids)
+
+    total_sessions = len(lengths)
+    return sch.AnalyticsRoutes(
+        from_=dfrom.isoformat() if dfrom else None,
+        to=dto.isoformat() if dto else None,
+        total_sessions_with_route=total_sessions,
+        avg_halls_per_session=round(statistics.fmean(lengths), 2) if lengths else 0.0,
+        top_hall_visits=[sch.AnalyticsRouteHall(id=h, name=names.get(h), count=c) for h, c in visits.most_common(limit)],
+        top_entry_halls=[sch.AnalyticsRouteHall(id=h, name=names.get(h), count=c) for h, c in entries.most_common(limit)],
+        top_transitions=[
+            sch.AnalyticsRouteTransition(
+                from_hall_id=a, from_hall_name=names.get(a), to_hall_id=b, to_hall_name=names.get(b), count=c
+            )
+            for (a, b), c in transitions.most_common(limit)
+        ],
+        top_paths=[
+            sch.AnalyticsRoutePath(
+                halls=[sch.AnalyticsRouteHall(id=h, name=names.get(h), count=visits.get(h, 0)) for h in path],
+                count=c,
+            )
+            for path, c in paths.most_common(limit)
+        ],
+    )

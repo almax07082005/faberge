@@ -13,7 +13,7 @@ from .. import schemas as sch
 from ..config import settings
 from ..db import get_session
 from ..dependencies import require_admin
-from ..services import UpstreamError, storage
+from ..services import UpstreamError, llm, storage
 
 # Логин выдаёт токен, поэтому НЕ должен сам требовать токен — отдельный роутер без require_admin.
 auth_router = APIRouter(prefix="/admin", tags=["Администрирование"])
@@ -48,6 +48,24 @@ async def _read_validated_image(file: UploadFile) -> bytes:
     return data
 
 
+async def _autofill_spoken(data: sch.BaseModel) -> None:
+    """E15: заполнить `short_description_spoken` из `short_description` через LLM.
+
+    Правила:
+      • если админ передал `short_description_spoken` явно — уважаем как ручное
+        переопределение и не трогаем;
+      • пересчитываем только когда в запросе меняется `short_description`;
+      • если LLM недоступен/не настроен — `to_spoken_text` вернёт None, и озвучка
+        уедет по фолбэку (исходное описание + детерминированная нормализация).
+    """
+    fields = data.model_fields_set
+    if "short_description_spoken" in fields or "short_description" not in fields:
+        return
+    spoken = await llm.to_spoken_text(getattr(data, "short_description", None))
+    data.short_description_spoken = spoken
+    data.model_fields_set.add("short_description_spoken")
+
+
 @router.post("/halls", response_model=sch.HallDetail, status_code=201, summary="[Вне MVP] Создать зал")
 async def create_hall(data: sch.HallCreate, session: AsyncSession = Depends(get_session)) -> sch.HallDetail:
     try:
@@ -69,6 +87,27 @@ async def patch_hall(
     except IntegrityError:
         await session.rollback()
         raise HTTPException(status_code=409, detail="Зал с таким номером уже существует.")
+
+
+@router.put(
+    "/halls/reorder", response_model=sch.HallListResponse,
+    summary="Изменить порядок залов (drag-n-drop)",
+    description=(
+        "Переставляет залы (C11). В теле — `hall_ids` в желаемом порядке. Залы "
+        "переставляются в рамках своих текущих позиций (можно слать как весь "
+        "список, так и подсписок одной группы — «Основная экспозиция» или "
+        "«Временная выставка»). Возвращает залы в новом порядке. Порядок также "
+        "можно менять точечно через `PATCH /admin/halls/{id}` (поле `sort_order`)."
+    ),
+)
+async def reorder_halls(
+    data: sch.HallReorderRequest, session: AsyncSession = Depends(get_session)
+) -> sch.HallListResponse:
+    try:
+        await crud.reorder_halls(session, data.hall_ids)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    return await crud.list_halls(session, limit=1000, offset=0)
 
 
 @router.post(
@@ -174,6 +213,7 @@ async def delete_showcase(
 async def create_exhibit(data: sch.ExhibitCreate, session: AsyncSession = Depends(get_session)) -> sch.ExhibitAdmin:
     if not await crud.showcase_exists(session, data.showcase_id):
         raise HTTPException(status_code=404, detail="Витрина не найдена.")
+    await _autofill_spoken(data)
     try:
         ex = await crud.create_exhibit(session, data)
     except IntegrityError:
@@ -207,6 +247,7 @@ async def update_exhibit(
     ex = await crud.get_exhibit_orm(session, exhibit_id)
     if ex is None:
         raise HTTPException(status_code=404, detail="Экспонат не найден.")
+    await _autofill_spoken(data)
     try:
         ex = await crud.replace_exhibit(session, ex, data)
     except IntegrityError:
@@ -222,6 +263,7 @@ async def patch_exhibit(
     ex = await crud.get_exhibit_orm(session, exhibit_id)
     if ex is None:
         raise HTTPException(status_code=404, detail="Экспонат не найден.")
+    await _autofill_spoken(data)
     try:
         ex = await crud.patch_exhibit(session, ex, data)
     except IntegrityError:
@@ -239,6 +281,30 @@ async def delete_exhibit(exhibit_id: int = Path(ge=1), session: AsyncSession = D
     await crud.delete_exhibit(session, ex)
     # Чистим объекты из хранилища после успешного удаления из БД (best-effort).
     await storage.delete_many(image_urls)
+
+
+@router.post(
+    "/exhibits/{exhibit_id}/spoken/regenerate", response_model=sch.ExhibitAdmin,
+    summary="Перегенерировать озвучку описания (числа прописью)",
+    description=(
+        "Заново генерирует `short_description_spoken` из текущего `short_description` "
+        "через LLM (E15): римские/арабские числа → слова в нужном падеже "
+        "(«Александр III» → «Александр Третий»). Используется, если админ правил "
+        "описание в обход авто-генерации или хочет пересобрать озвучку. "
+        "Требует настроенного LLM (иначе `503`)."
+    ),
+)
+async def regenerate_spoken(
+    exhibit_id: int = Path(ge=1), session: AsyncSession = Depends(get_session)
+) -> sch.ExhibitAdmin:
+    ex = await crud.get_exhibit_orm(session, exhibit_id)
+    if ex is None:
+        raise HTTPException(status_code=404, detail="Экспонат не найден.")
+    if not settings.llm_configured:
+        raise HTTPException(status_code=503, detail="LLM не настроен — озвучку прописью сгенерировать нельзя.")
+    spoken = await llm.to_spoken_text(ex.short_description)
+    ex = await crud.patch_exhibit(session, ex, sch.ExhibitPatch(short_description_spoken=spoken))
+    return crud.to_exhibit(ex, admin=True)
 
 
 @router.get(
@@ -309,6 +375,59 @@ async def analytics_overview(
     session: AsyncSession = Depends(get_session),
 ) -> sch.AnalyticsOverview:
     return await crud.analytics_overview(session, from_, to)
+
+
+@router.get(
+    "/analytics/questions", response_model=sch.AnalyticsQuestions,
+    summary="Аналитика: частые и редкие вопросы",
+    description=(
+        "Агрегирует реплики посетителей (`guide_messages`, role=user): топ частых и "
+        "редких формулировок (нормализация trim+lower), всего/уникальных вопросов. "
+        "Опциональные `from`/`to` (даты, `to` не включительно), `limit` — размер топов."
+    ),
+)
+async def analytics_questions(
+    from_: Optional[date] = Query(None, alias="from"),
+    to: Optional[date] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+) -> sch.AnalyticsQuestions:
+    return await crud.analytics_questions(session, from_, to, limit)
+
+
+@router.get(
+    "/analytics/engagement", response_model=sch.AnalyticsEngagement,
+    summary="Аналитика: длительность сессии (первое открытие → последнее действие)",
+    description=(
+        "Время от первого события сессии до последнего (по `events`): среднее, "
+        "медиана, максимум, среднее число событий на сессию и распределение по "
+        "корзинам длительности. Опциональные `from`/`to`."
+    ),
+)
+async def analytics_engagement(
+    from_: Optional[date] = Query(None, alias="from"),
+    to: Optional[date] = Query(None),
+    session: AsyncSession = Depends(get_session),
+) -> sch.AnalyticsEngagement:
+    return await crud.analytics_engagement(session, from_, to)
+
+
+@router.get(
+    "/analytics/routes", response_model=sch.AnalyticsRoutes,
+    summary="Аналитика: маршрут пользователя по залам",
+    description=(
+        "Строит маршруты по залам из событий `hall_view`: посещения залов, точки "
+        "входа, переходы A→B и частые полные пути; среднее число залов на сессию. "
+        "Опциональные `from`/`to`, `limit` — размер топов."
+    ),
+)
+async def analytics_routes(
+    from_: Optional[date] = Query(None, alias="from"),
+    to: Optional[date] = Query(None),
+    limit: int = Query(10, ge=1, le=50),
+    session: AsyncSession = Depends(get_session),
+) -> sch.AnalyticsRoutes:
+    return await crud.analytics_routes(session, from_, to, limit)
 
 
 async def _exhibit_exists(session: AsyncSession, exhibit_id: int) -> bool:
