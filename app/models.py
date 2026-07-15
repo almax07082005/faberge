@@ -35,6 +35,7 @@ class Hall(Base):
     level: Mapped[Optional[int]] = mapped_column(Integer)
     cover_image_url: Mapped[Optional[str]] = mapped_column(Text)
     is_temporary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
@@ -71,6 +72,7 @@ class Exhibit(Base):
     master_name: Mapped[Optional[str]] = mapped_column(String(255))
     material: Mapped[Optional[str]] = mapped_column(String(255))
     short_description: Mapped[Optional[str]] = mapped_column(Text)
+    short_description_spoken: Mapped[Optional[str]] = mapped_column(Text)
     raw_history: Mapped[Optional[str]] = mapped_column(Text)
     image_url: Mapped[Optional[str]] = mapped_column(Text)
     model_3d_url: Mapped[Optional[str]] = mapped_column(Text)

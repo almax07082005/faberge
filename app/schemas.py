@@ -27,6 +27,7 @@ class Hall(BaseModel):
     level: Optional[int] = None
     cover_image_url: Optional[str] = None
     is_temporary: bool = False            # зал временной выставки (vs основная экспозиция)
+    sort_order: int = 0                   # порядок вывода в каталоге/админке (drag-n-drop, C11)
     showcase_count: Optional[int] = None
     exhibit_count: Optional[int] = None
 
@@ -129,6 +130,9 @@ class Exhibit(BaseModel):
 
 class ExhibitAdmin(Exhibit):
     raw_history: Optional[str] = None
+    # Версия short_description для озвучки: числа прописью в нужном падеже (E15).
+    # Автогенерируется LLM при сохранении описания; админ может переопределить вручную.
+    short_description_spoken: Optional[str] = None
 
 
 class ExhibitListResponse(BaseModel):
@@ -260,6 +264,7 @@ class HallCreate(BaseModel):
     description: Optional[str] = None
     level: Optional[int] = None
     is_temporary: bool = False
+    sort_order: Optional[int] = None      # если не указан — бэкенд ставит hall_number
 
 
 class HallPatch(BaseModel):
@@ -269,6 +274,16 @@ class HallPatch(BaseModel):
     level: Optional[int] = None
     cover_image_url: Optional[str] = None
     is_temporary: Optional[bool] = None
+    sort_order: Optional[int] = None
+
+
+class HallReorderRequest(BaseModel):
+    # Список id залов в желаемом порядке (drag-n-drop). Залы переставляются в
+    # рамках своих текущих позиций (slot-preserving): бэкенд берёт их нынешние
+    # sort_order, сортирует и раздаёт в новом порядке. Поэтому можно переставлять
+    # как весь список сразу, так и подсписок одной группы (основная/временная) —
+    # позиции залов вне запроса не затрагиваются.
+    hall_ids: List[int] = Field(min_length=1)
 
 
 class LoginRequest(BaseModel):
@@ -295,6 +310,9 @@ class ExhibitCreate(BaseModel):
     master_name: Optional[str] = None
     material: Optional[str] = None
     short_description: Optional[str] = None
+    # Ручное переопределение озвучки (числа прописью). Если не передан —
+    # бэкенд сгенерирует его из short_description через LLM (E15).
+    short_description_spoken: Optional[str] = None
     raw_history: Optional[str] = None
     image_url: Optional[str] = None
     model_3d_url: Optional[str] = None
@@ -312,6 +330,7 @@ class ExhibitPatch(BaseModel):
     master_name: Optional[str] = None
     material: Optional[str] = None
     short_description: Optional[str] = None
+    short_description_spoken: Optional[str] = None
     raw_history: Optional[str] = None
     image_url: Optional[str] = None
     model_3d_url: Optional[str] = None
@@ -334,12 +353,82 @@ class AnalyticsOverview(BaseModel):
     from_: Optional[str] = Field(default=None, alias="from")
     to: Optional[str] = None
     total_sessions: int = 0
+    total_app_opens: int = 0
     total_recognitions: int = 0
     recognition_success_rate: float = 0.0
     total_chat_messages: int = 0
     total_audio_plays: int = 0
     top_exhibits: List[AnalyticsTopItem] = Field(default_factory=list)
     top_halls: List[AnalyticsTopItem] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ── Аналитика: частые/редкие вопросы (C16) ───────────────────────────────────
+class AnalyticsQuestionItem(BaseModel):
+    question: str
+    count: int
+
+
+class AnalyticsQuestions(BaseModel):
+    from_: Optional[str] = Field(default=None, alias="from")
+    to: Optional[str] = None
+    total_questions: int = 0          # всего реплик пользователя (role='user')
+    unique_questions: int = 0         # различных формулировок (после нормализации)
+    frequent: List[AnalyticsQuestionItem] = Field(default_factory=list)  # топ по убыванию
+    rare: List[AnalyticsQuestionItem] = Field(default_factory=list)      # редкие (по возрастанию)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ── Аналитика: вовлечённость / длительность сессии (C17) ─────────────────────
+class AnalyticsDurationBucket(BaseModel):
+    label: str                        # напр. "0–1 мин", "1–5 мин"
+    count: int
+
+
+class AnalyticsEngagement(BaseModel):
+    from_: Optional[str] = Field(default=None, alias="from")
+    to: Optional[str] = None
+    total_sessions: int = 0
+    avg_duration_sec: float = 0.0     # среднее от первого открытия до последнего действия
+    median_duration_sec: float = 0.0
+    max_duration_sec: float = 0.0
+    avg_events_per_session: float = 0.0
+    buckets: List[AnalyticsDurationBucket] = Field(default_factory=list)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# ── Аналитика: маршрут пользователя по залам (C18) ───────────────────────────
+class AnalyticsRouteHall(BaseModel):
+    id: int
+    name: Optional[str] = None
+    count: int
+
+
+class AnalyticsRouteTransition(BaseModel):
+    from_hall_id: int
+    from_hall_name: Optional[str] = None
+    to_hall_id: int
+    to_hall_name: Optional[str] = None
+    count: int
+
+
+class AnalyticsRoutePath(BaseModel):
+    halls: List[AnalyticsRouteHall] = Field(default_factory=list)  # последовательность залов
+    count: int
+
+
+class AnalyticsRoutes(BaseModel):
+    from_: Optional[str] = Field(default=None, alias="from")
+    to: Optional[str] = None
+    total_sessions_with_route: int = 0
+    avg_halls_per_session: float = 0.0
+    top_hall_visits: List[AnalyticsRouteHall] = Field(default_factory=list)
+    top_entry_halls: List[AnalyticsRouteHall] = Field(default_factory=list)     # с какого зала начинают
+    top_transitions: List[AnalyticsRouteTransition] = Field(default_factory=list)  # переходы A→B
+    top_paths: List[AnalyticsRoutePath] = Field(default_factory=list)           # частые полные маршруты
 
     model_config = ConfigDict(populate_by_name=True)
 

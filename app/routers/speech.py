@@ -19,7 +19,10 @@ async def synthesize_speech(req: sch.SpeechRequest, session: AsyncSession = Depe
         ex = await crud.get_exhibit_orm(session, req.exhibit_id)
         if ex is None:
             raise HTTPException(status_code=404, detail="Экспонат не найден.")
-        text = ex.short_description or ex.name
+        # E15: озвучиваем spoken-версию (числа прописью в нужном падеже). Если её
+        # нет (LLM не сгенерировал/не настроен) — исходное описание, а римские
+        # цифры подчистит детерминированный normalize_for_tts внутри tts.synthesize.
+        text = ex.short_description_spoken or ex.short_description or ex.name
     if not text:
         raise HTTPException(status_code=400, detail="Укажите text или exhibit_id.")
 

@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS halls (
     level           INT,                        -- этаж/уровень в здании
     cover_image_url TEXT,
     is_temporary    BOOLEAN NOT NULL DEFAULT false,  -- зал временной выставки (vs основная экспозиция)
+    sort_order      INT NOT NULL DEFAULT 0,     -- порядок вывода залов в каталоге/админке (drag-n-drop)
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -40,6 +41,12 @@ CREATE TABLE IF NOT EXISTS halls (
 -- не добавит колонку к таблице, созданной ранее). Повторный запуск init_db.py
 -- безопасен: столбец добавляется только при отсутствии.
 ALTER TABLE halls ADD COLUMN IF NOT EXISTS is_temporary BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE halls ADD COLUMN IF NOT EXISTS sort_order   INT NOT NULL DEFAULT 0;
+
+-- Бэкофилл порядка для залов, которым его ещё не задавали (sort_order = 0):
+-- берём hall_number как естественный первичный порядок. Reorder присваивает
+-- значения 1..N, поэтому переставленные админом залы сюда уже не попадут.
+UPDATE halls SET sort_order = hall_number WHERE sort_order = 0;
 
 -- Витрины --------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS showcases (
@@ -62,6 +69,7 @@ CREATE TABLE IF NOT EXISTS exhibits (
     master_name       VARCHAR(255),
     material          VARCHAR(255),
     short_description TEXT,
+    short_description_spoken TEXT,              -- версия short_description для TTS: числа прописью в нужном падеже (LLM)
     raw_history       TEXT,                     -- внутренние факты для YandexGPT
     image_url         TEXT,
     model_3d_url      TEXT,                     -- ссылка на 3D-модель Koinovo
@@ -71,6 +79,9 @@ CREATE TABLE IF NOT EXISTS exhibits (
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Идемпотентная миграция для существующих БД (см. пояснение у halls выше).
+ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS short_description_spoken TEXT;
 
 -- Галерея изображений экспоната ----------------------------------------------
 CREATE TABLE IF NOT EXISTS exhibit_images (
@@ -118,8 +129,10 @@ CREATE INDEX IF NOT EXISTS idx_exhibits_showcase    ON exhibits(showcase_id);
 CREATE INDEX IF NOT EXISTS idx_exhibit_images_exh   ON exhibit_images(exhibit_id);
 CREATE INDEX IF NOT EXISTS idx_guide_messages_sess  ON guide_messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_type_ts       ON events(type, ts);
+CREATE INDEX IF NOT EXISTS idx_events_session_ts    ON events(session_id, ts);  -- аналитика по сессиям (C17/C18)
 CREATE INDEX IF NOT EXISTS idx_halls_name_trgm      ON halls    USING gin (name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_halls_is_temporary    ON halls(is_temporary);
+CREATE INDEX IF NOT EXISTS idx_halls_sort_order      ON halls(sort_order);
 CREATE INDEX IF NOT EXISTS idx_exhibits_name_trgm   ON exhibits USING gin (name gin_trgm_ops);
 
 -- Триггеры updated_at --------------------------------------------------------
