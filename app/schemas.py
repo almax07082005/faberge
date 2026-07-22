@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ── Система ──────────────────────────────────────────────────────────────────
@@ -99,6 +99,7 @@ class Image(BaseModel):
 class ExhibitSummary(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
+    exhibit_number: Optional[str] = None  # номер по путеводителю музея (B3): перед названием
     label_slug: Optional[str] = None
     name: str
     year_created: Optional[int] = None
@@ -112,6 +113,7 @@ class ExhibitSummary(BaseModel):
 class Exhibit(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
+    exhibit_number: Optional[str] = None  # номер по путеводителю музея (B3)
     label_slug: Optional[str] = None
     name: str
     year_created: Optional[int] = None
@@ -120,6 +122,7 @@ class Exhibit(BaseModel):
     short_description: Optional[str] = None
     image_url: Optional[str] = None
     images: List[Image] = Field(default_factory=list)
+    video_url: Optional[str] = None       # видео экспоната (B4/C22)
     model_3d_url: Optional[str] = None
     model_3d_embed: Optional[str] = None
     audio_url: Optional[str] = None
@@ -155,6 +158,8 @@ class RecognitionCandidate(BaseModel):
     label_slug: str
     name: Optional[str] = None
     confidence: float
+    exhibit_id: Optional[int] = None      # id карточки экспоната для перехода (B5/E19)
+    thumbnail_url: Optional[str] = None   # миниатюра кандидата (= exhibits.image_url) (B5/E19)
 
 
 class RecognitionResponse(BaseModel):
@@ -216,11 +221,43 @@ class ChatRequest(BaseModel):
     max_questions: int = Field(default=3, ge=0, le=6)
 
 
+# Плашка экспоната в ответе гида (B6): фронт рисует компонент exhibit-plaque.
+class ReferencedExhibit(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    name: str
+    exhibit_number: Optional[str] = None
+    thumbnail_url: Optional[str] = None
+    hall_number: Optional[int] = None
+    showcase_number: Optional[int] = None
+
+
+# Структурированный зал в ответе гида (B10): «какие залы есть».
+class ReferencedHall(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    hall_number: int
+    name: Optional[str] = None
+
+
+# Навигационный ответ «зал + витрина» (B7): «как найти экспонат».
+class GuideLocation(BaseModel):
+    hall_number: Optional[int] = None
+    hall_name: Optional[str] = None
+    showcase_number: Optional[int] = None
+
+
 class ChatResponse(BaseModel):
     session_id: uuid.UUID
     answer: str
     suggested_questions: List[str] = Field(default_factory=list)
     context: Optional[GuideContext] = None
+    # Экспонаты, на которые ссылается ответ (B6): плашки-ссылки на карточки.
+    referenced_exhibits: List[ReferencedExhibit] = Field(default_factory=list)
+    # Залы, если вопрос про список/навигацию по залам (B10).
+    referenced_halls: List[ReferencedHall] = Field(default_factory=list)
+    # Где искать экспонат, если вопрос навигационный (B7).
+    location: Optional[GuideLocation] = None
 
 
 # ── Озвучивание ──────────────────────────────────────────────────────────────
@@ -276,6 +313,14 @@ class HallPatch(BaseModel):
     is_temporary: Optional[bool] = None
     sort_order: Optional[int] = None
 
+    @model_validator(mode="after")
+    def _reject_null_required(self) -> "HallPatch":
+        # Не-nullable в БД поля нельзя обнулять явным null (иначе IntegrityError → 409).
+        for field in ("hall_number", "is_temporary", "sort_order"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"Поле '{field}' не может быть null.")
+        return self
+
 
 class HallReorderRequest(BaseModel):
     # Список id залов в желаемом порядке (drag-n-drop). Залы переставляются в
@@ -302,8 +347,27 @@ class ShowcaseCreate(BaseModel):
     name: Optional[str] = None
 
 
+class ShowcasePatch(BaseModel):
+    # Частичное обновление витрины (B2/E14). Фронт (updateShowcase в lib/api/admin.ts)
+    # шлёт любой поднабор из {hall_id, showcase_number, name}.
+    hall_id: Optional[int] = None
+    showcase_number: Optional[int] = None
+    name: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _reject_null_required(self) -> "ShowcasePatch":
+        # hall_id и showcase_number — NOT NULL в БД: явный null это ошибка ввода (422),
+        # а не «поле не передано». Иначе IntegrityError маппился бы в неверный 409.
+        # name допускает null (в БД nullable).
+        for field in ("hall_id", "showcase_number"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"Поле '{field}' не может быть null.")
+        return self
+
+
 class ExhibitCreate(BaseModel):
     showcase_id: int
+    exhibit_number: Optional[str] = None  # номер по путеводителю музея (B3)
     label_slug: Optional[str] = None
     name: str
     year_created: Optional[int] = None
@@ -315,6 +379,7 @@ class ExhibitCreate(BaseModel):
     short_description_spoken: Optional[str] = None
     raw_history: Optional[str] = None
     image_url: Optional[str] = None
+    video_url: Optional[str] = None       # видео экспоната (B4/C22)
     model_3d_url: Optional[str] = None
 
 
@@ -324,6 +389,7 @@ class ExhibitUpdate(ExhibitCreate):
 
 class ExhibitPatch(BaseModel):
     showcase_id: Optional[int] = None
+    exhibit_number: Optional[str] = None
     label_slug: Optional[str] = None
     name: Optional[str] = None
     year_created: Optional[int] = None
@@ -333,6 +399,7 @@ class ExhibitPatch(BaseModel):
     short_description_spoken: Optional[str] = None
     raw_history: Optional[str] = None
     image_url: Optional[str] = None
+    video_url: Optional[str] = None
     model_3d_url: Optional[str] = None
 
 

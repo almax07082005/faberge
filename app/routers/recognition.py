@@ -47,9 +47,19 @@ async def recognize_exhibit(
         ex = await crud.get_exhibit_by_slug_orm(session, outcome.label_slug)
         exhibit = crud.to_exhibit(ex) if ex else None
 
-    names = await crud.names_by_slugs(session, [slug for slug, _ in outcome.candidates])
+    slugs = [slug for slug, _ in outcome.candidates]
+    names = await crud.names_by_slugs(session, slugs)
+    # B5/E19: к каждому кандидату — id карточки и миниатюра, чтобы фронт вёл на
+    # карточку экспоната (а не в чат) и показывал фото.
+    briefs = await crud.candidates_by_slugs(session, slugs)
     candidates = [
-        sch.RecognitionCandidate(label_slug=slug, name=names.get(slug), confidence=conf)
+        sch.RecognitionCandidate(
+            label_slug=slug,
+            name=names.get(slug),
+            confidence=conf,
+            exhibit_id=briefs.get(slug, (None, None))[0],
+            thumbnail_url=briefs.get(slug, (None, None))[1],
+        )
         for slug, conf in outcome.candidates
     ]
 

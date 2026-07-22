@@ -66,7 +66,7 @@ info:
     - **ИИ-гид** — генерация рассказа (YandexGPT) и диалог с подсказками.
     - **Озвучивание** — синтез речи (SpeechKit) для кнопки «Прослушать».
     - **Администрирование** *(вне MVP)* — CRUD экспонатов и аналитика.
-    - **Телеметрия** *(вне MVP)* — сбор событий для аналитики.
+    - **Телеметрия** — сбор событий для аналитики (обязательный контракт с 21.07.2026).
 
     ## Аутентификация
 
@@ -140,7 +140,7 @@ tags:
   - name: Администрирование
     description: '[Вне MVP] CRUD экспонатов и административная аналитика.'
   - name: Телеметрия
-    description: '[Вне MVP] Приём пользовательских событий для аналитики.'
+    description: Приём пользовательских событий для аналитики (обязательный контракт с 21.07.2026).
 
 x-tagGroups:
   - name: MVP (25 мая – 25 июня)
@@ -152,10 +152,10 @@ x-tagGroups:
       - Распознавание
       - ИИ-гид
       - Озвучивание
+      - Телеметрия
   - name: Дальнейшие шаги (вне MVP)
     tags:
       - Администрирование
-      - Телеметрия
 
 # По умолчанию эндпоинты публичные; admin переопределяет на уровне операции.
 security: []
@@ -1064,6 +1064,39 @@ paths:
           $ref: '#/components/responses/UnprocessableEntity'
 
   /admin/showcases/{showcase_id}:
+    patch:
+      tags: [Администрирование]
+      summary: '[Вне MVP] Частично обновить витрину'
+      description: >-
+        Частичное обновление витрины (E14): любой поднабор
+        `{hall_id, showcase_number, name}`. Перенос в другой зал и смена номера
+        учитывают уникальность `(hall_id, showcase_number)` — при конфликте `409`.
+      operationId: updateShowcase
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ShowcaseId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShowcasePatch'
+      responses:
+        '200':
+          description: Витрина обновлена.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShowcaseDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
     delete:
       tags: [Администрирование]
       summary: '[Вне MVP] Удалить витрину'
@@ -1533,15 +1566,16 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
-  # ───────────────────────── Телеметрия [вне MVP] ────────────────────────
+  # ───────────────────────────── Телеметрия ──────────────────────────────
   /telemetry/events:
     post:
       tags: [Телеметрия]
-      summary: '[Вне MVP] Отправить события'
+      summary: Отправить события
       description: >-
-        Пакетный приём анонимных пользовательских событий (просмотр экспоната,
-        распознавание, сообщение в чате, прослушивание) — источник данных для
-        административной аналитики.
+        Пакетный приём анонимных пользовательских событий (app_open, hall_view,
+        exhibit_view, recognition, audio_play) — источник данных для
+        административной аналитики. С 21.07.2026 — обязательная часть контракта:
+        без событий GET /admin/analytics/engagement и /analytics/routes пусты (B11).
       operationId: ingestEvents
       security: []
       requestBody:
@@ -1954,6 +1988,13 @@ components:
         id:
           type: integer
           example: 101
+        exhibit_number:
+          type: string
+          nullable: true
+          description: >-
+            Номер экспоната по путеводителю музея (B3). Показывается перед
+            названием в каталоге. Строка — в путеводителе бывают номера вида «12а».
+          example: '12'
         label_slug:
           type: string
           nullable: true
@@ -2001,6 +2042,11 @@ components:
         id:
           type: integer
           example: 101
+        exhibit_number:
+          type: string
+          nullable: true
+          description: Номер экспоната по путеводителю музея (B3), показывается перед названием.
+          example: '12'
         label_slug:
           type: string
           nullable: true
@@ -2035,9 +2081,15 @@ components:
           example: https://cdn.example.cloud/exhibits/coronation/main.jpg
         images:
           type: array
-          description: Галерея изображений.
+          description: Галерея изображений (публичная, B4/C22).
           items:
             $ref: '#/components/schemas/Image'
+        video_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Видео экспоната, если есть (B4/C22).
+          example: https://cdn.example.cloud/exhibits/coronation/video.mp4
         model_3d_url:
           type: string
           format: uri
@@ -2121,6 +2173,19 @@ components:
           minimum: 0
           maximum: 1
           example: 0.41
+        exhibit_id:
+          type: integer
+          nullable: true
+          description: >-
+            Идентификатор карточки экспоната, чтобы выбор кандидата вёл на карточку,
+            а не в чат (B5/E19). `null`, если для класса нет экспоната в каталоге.
+          example: 102
+        thumbnail_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Миниатюра кандидата (= exhibits.image_url) для показа в списке (B5/E19).
+          example: https://cdn.example.cloud/exhibits/winter/thumb.jpg
 
     RecognitionResponse:
       type: object
@@ -2317,6 +2382,86 @@ components:
             type: string
         context:
           $ref: '#/components/schemas/GuideContext'
+        referenced_exhibits:
+          type: array
+          description: >-
+            Экспонаты, на которые ссылается ответ (B6/C23) — фронт рисует плашки
+            со ссылкой на карточку (компонент exhibit-plaque). Пусто, если ответ
+            ни на что конкретное не ссылается.
+          items:
+            $ref: '#/components/schemas/ReferencedExhibit'
+        referenced_halls:
+          type: array
+          description: Залы структурой (B10/C25) — когда вопрос про список залов.
+          items:
+            $ref: '#/components/schemas/ReferencedHall'
+        location:
+          allOf:
+            - $ref: '#/components/schemas/GuideLocation'
+          nullable: true
+          description: Где искать экспонат (B7/C24) — заполняется на навигационный вопрос.
+
+    ReferencedExhibit:
+      type: object
+      description: Плашка экспоната в ответе гида (B6) со ссылкой на карточку.
+      required: [id, name]
+      properties:
+        id:
+          type: integer
+          example: 101
+        name:
+          type: string
+          example: Яйцо «Коронационное»
+        exhibit_number:
+          type: string
+          nullable: true
+          example: '12'
+        thumbnail_url:
+          type: string
+          format: uri
+          nullable: true
+          example: https://cdn.example.cloud/exhibits/coronation/thumb.jpg
+        hall_number:
+          type: integer
+          nullable: true
+          example: 3
+        showcase_number:
+          type: integer
+          nullable: true
+          example: 2
+
+    ReferencedHall:
+      type: object
+      description: Структурированный зал в ответе гида (B10).
+      required: [id, hall_number]
+      properties:
+        id:
+          type: integer
+          example: 3
+        hall_number:
+          type: integer
+          example: 3
+        name:
+          type: string
+          nullable: true
+          example: Синяя гостиная
+
+    GuideLocation:
+      type: object
+      description: Навигационный ответ «зал + витрина» (B7).
+      properties:
+        hall_number:
+          type: integer
+          nullable: true
+          example: 3
+        hall_name:
+          type: string
+          nullable: true
+          example: Синяя гостиная
+        showcase_number:
+          type: integer
+          nullable: true
+          example: 2
 
     # ── Озвучивание ──
     SpeechVoice:
@@ -2506,6 +2651,23 @@ components:
           type: string
           nullable: true
 
+    ShowcasePatch:
+      type: object
+      description: >-
+        Частичное обновление витрины (B2/E14) — все поля необязательны. Контракт
+        совпадает с updateShowcase() во фронтовом lib/api/admin.ts.
+      properties:
+        hall_id:
+          type: integer
+          description: Перенести витрину в другой зал.
+          example: 5
+        showcase_number:
+          type: integer
+          example: 3
+        name:
+          type: string
+          nullable: true
+
     ExhibitCreate:
       type: object
       required: [showcase_id, name]
@@ -2513,6 +2675,11 @@ components:
         showcase_id:
           type: integer
           example: 12
+        exhibit_number:
+          type: string
+          nullable: true
+          description: Номер экспоната по путеводителю музея (B3).
+          example: '12'
         label_slug:
           type: string
           nullable: true
@@ -2557,6 +2724,11 @@ components:
           type: string
           format: uri
           nullable: true
+        video_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Видео экспоната (B4/C22).
         model_3d_url:
           type: string
           format: uri
@@ -2573,6 +2745,10 @@ components:
       properties:
         showcase_id:
           type: integer
+        exhibit_number:
+          type: string
+          nullable: true
+          description: Номер экспоната по путеводителю музея (B3).
         label_slug:
           type: string
           pattern: '^[a-z0-9_]+$'
@@ -2604,6 +2780,11 @@ components:
           type: string
           format: uri
           nullable: true
+        video_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Видео экспоната (B4/C22).
         model_3d_url:
           type: string
           format: uri

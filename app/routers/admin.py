@@ -181,6 +181,30 @@ async def create_showcase(data: sch.ShowcaseCreate, session: AsyncSession = Depe
         raise HTTPException(status_code=409, detail="Витрина с таким номером уже существует в этом зале.")
 
 
+@router.patch(
+    "/showcases/{showcase_id}", response_model=sch.ShowcaseDetail,
+    summary="[Вне MVP] Частично обновить витрину",
+    description=(
+        "Частичное обновление витрины (E14): любой поднабор `{hall_id, showcase_number, "
+        "name}`. Перенос в другой зал (`hall_id`) и смена `showcase_number` учитывают "
+        "уникальность `(hall_id, showcase_number)` — при конфликте `409`."
+    ),
+)
+async def patch_showcase(
+    data: sch.ShowcasePatch, showcase_id: int = Path(ge=1), session: AsyncSession = Depends(get_session)
+) -> sch.ShowcaseDetail:
+    sc = await crud.get_showcase_orm(session, showcase_id)
+    if sc is None:
+        raise HTTPException(status_code=404, detail="Витрина не найдена.")
+    if data.hall_id is not None and not await crud.hall_exists(session, data.hall_id):
+        raise HTTPException(status_code=404, detail="Зал не найден.")
+    try:
+        return await crud.patch_showcase(session, sc, data)
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="Витрина с таким номером уже существует в этом зале.")
+
+
 @router.delete(
     "/showcases/{showcase_id}", status_code=204, summary="[Вне MVP] Удалить витрину",
     description=(
