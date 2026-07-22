@@ -167,13 +167,15 @@ async def chat(req: sch.ChatRequest, session: AsyncSession = Depends(get_session
     location: Optional[sch.GuideLocation] = None
     questions: List[str] = []
 
+    # B9 — поиск по номеру. Реплика-номер неоднозначна (это может быть год «1885»
+    # или количество), поэтому ветку берём ТОЛЬКО при реальном совпадении по номеру;
+    # иначе (0 совпадений) проваливаемся в обычный диалог, а не в тупик «не нашёл».
     number = guide_intel.parse_exhibit_number(req.message)
+    number_matches = await crud.exhibits_by_number(session, number) if number is not None else []
 
-    if number is not None:
-        # B9 — поиск по номеру экспоната + уточняющий диалог для неуникальных номеров.
-        matches = await crud.exhibits_by_number(session, number)
-        if len(matches) == 1:
-            target = matches[0]
+    if number_matches:
+        if len(number_matches) == 1:
+            target = number_matches[0]
             answer = _describe_exhibit(target)
             referenced_exhibits = [crud.to_referenced_exhibit(target)]
             location = crud.to_location(target)
@@ -181,18 +183,14 @@ async def chat(req: sch.ChatRequest, session: AsyncSession = Depends(get_session
             context = sch.GuideContext(
                 exhibit_id=target.id, label_slug=target.label_slug, hall_id=hall.id if hall else None
             )
-        elif len(matches) > 1:
+        else:
+            # Неуникальный номер — уточняющий диалог (B9).
             answer = (
                 f"Экспонат №{number} встречается в нескольких витринах. "
                 "Уточните, пожалуйста, зал или витрину:"
             )
-            referenced_exhibits = [crud.to_referenced_exhibit(e) for e in matches[:4]]
-            questions = [_where_hint(e) for e in matches][:6]
-        else:
-            answer = (
-                f"Экспонат с номером {number} я не нашёл. "
-                "Проверьте номер или назовите экспонат словами."
-            )
+            referenced_exhibits = [crud.to_referenced_exhibit(e) for e in number_matches[:4]]
+            questions = [_where_hint(e) for e in number_matches][:6]
     elif guide_intel.is_hall_listing(req.message):
         # B10 — список залов структурой (детерминированно, без риска галлюцинаций).
         halls = await crud.all_halls_ordered(session)

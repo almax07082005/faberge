@@ -136,9 +136,9 @@ def main() -> int:
     check("B9 number → location (hall+showcase)", g.get("location") and g["location"].get("hall_number") == 3,
           f"location={g.get('location')}")
 
-    # B9: несуществующий номер → вежливый ответ, без падения.
+    # B9: несуществующий номер → проваливается в обычный диалог (не тупик), без падения.
     r = c.post("/guide/chat", json={"message": "№ 999999"})
-    check("B9 missing number handled", r.status_code == 200 and "999999" in r.json()["answer"])
+    check("B9 missing number falls through gracefully", r.status_code == 200, f"{r.status_code}")
 
     # ── B6/B7: навигационный вопрос про экспонат в контексте → location + плашка ──
     r = c.post("/guide/chat", json={

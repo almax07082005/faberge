@@ -7,7 +7,6 @@ from datetime import date
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import String, and_, cast, delete as sa_delete, func, or_, select, text, update as sa_update
-from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -388,11 +387,14 @@ async def names_by_slugs(session: AsyncSession, slugs: Sequence[str]) -> Dict[st
 
 # ── Поиск и retrieval (B1/B8/C27) ─────────────────────────────────────────────
 # Слой поиска по каталогу, доступный и из GET /search, и из ИИ-гида (retrieval).
-# Первичный путь — полнотекстовый поиск PostgreSQL по search_vector с ранжированием
-# (ts_rank); дополнительно ILIKE-подстрока ловит частичные совпадения (напр.
-# «коронац» без полного слова). Если колонки search_vector ещё нет (миграция не
-# применена на живой БД — см. заметку про дрейф), падаем в чистый ILIKE, чтобы
-# поиск продолжал работать.
+# Каждый запрос — одно условие ``search_vector @@ q OR <ILIKE>``:
+#   • FTS по взвешенному tsvector даёт ранжирование (ts_rank) и морфологию русского;
+#   • ILIKE-подстрока добирает частичные совпадения (напр. «коронац» без полного
+#     слова), которые FTS без префиксного поиска не находит.
+# Требует применённой миграции (колонки search_vector / exhibit_number). Это не
+# «мягкая» зависимость: exhibit_number/video_url — обычные колонки, которые ORM
+# селектит в КАЖДОМ запросе к экспонатам, поэтому без миграции падает весь модуль
+# экспонатов, а не только поиск (мигрируем ДО деплоя — см. db/migrations).
 def _exhibit_ilike(q: str):
     like = f"%{q}%"
     return or_(
@@ -423,44 +425,27 @@ def _ru_tsquery(q: str):
 
 
 async def search_exhibits_orm(session: AsyncSession, q: str, limit: int) -> List[m.Exhibit]:
-    """ORM-экспонаты по запросу: FTS-ранжирование + ILIKE-фолбэк. Загружает зал/витрину.
-
-    FTS-попытка обёрнута в SAVEPOINT: если колонки search_vector нет (миграция не
-    применена), откатывается только savepoint, а внешняя транзакция запроса (напр.
-    только что созданная guide-сессия) остаётся живой — падаем в чистый ILIKE.
-    """
+    """ORM-экспонаты по запросу: FTS-ранжирование + ILIKE-подстрока. Загружает зал/витрину."""
     tsq = _ru_tsquery(q)
-    try:
-        async with session.begin_nested():
-            stmt = (
-                select(m.Exhibit)
-                .options(*_EXHIBIT_SUMMARY)
-                .where(or_(m.Exhibit.search_vector.op("@@")(tsq), _exhibit_ilike(q)))
-                .order_by(func.ts_rank(m.Exhibit.search_vector, tsq).desc(), m.Exhibit.id)
-                .limit(limit)
-            )
-            return list((await session.execute(stmt)).scalars().all())
-    except DBAPIError:
-        stmt = (
-            select(m.Exhibit).options(*_EXHIBIT_SUMMARY).where(_exhibit_ilike(q)).order_by(m.Exhibit.id).limit(limit)
-        )
-        return list((await session.execute(stmt)).scalars().all())
+    stmt = (
+        select(m.Exhibit)
+        .options(*_EXHIBIT_SUMMARY)
+        .where(or_(m.Exhibit.search_vector.op("@@")(tsq), _exhibit_ilike(q)))
+        .order_by(func.ts_rank(m.Exhibit.search_vector, tsq).desc(), m.Exhibit.id)
+        .limit(limit)
+    )
+    return list((await session.execute(stmt)).scalars().all())
 
 
 async def search_halls_orm(session: AsyncSession, q: str, limit: int) -> List[m.Hall]:
     tsq = _ru_tsquery(q)
-    try:
-        async with session.begin_nested():
-            stmt = (
-                select(m.Hall)
-                .where(or_(m.Hall.search_vector.op("@@")(tsq), _hall_ilike(q)))
-                .order_by(func.ts_rank(m.Hall.search_vector, tsq).desc(), m.Hall.hall_number)
-                .limit(limit)
-            )
-            return list((await session.execute(stmt)).scalars().all())
-    except DBAPIError:
-        stmt = select(m.Hall).where(_hall_ilike(q)).order_by(m.Hall.hall_number).limit(limit)
-        return list((await session.execute(stmt)).scalars().all())
+    stmt = (
+        select(m.Hall)
+        .where(or_(m.Hall.search_vector.op("@@")(tsq), _hall_ilike(q)))
+        .order_by(func.ts_rank(m.Hall.search_vector, tsq).desc(), m.Hall.hall_number)
+        .limit(limit)
+    )
+    return list((await session.execute(stmt)).scalars().all())
 
 
 async def search(session: AsyncSession, q: str, limit: int) -> sch.SearchResponse:

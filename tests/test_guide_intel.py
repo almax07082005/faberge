@@ -28,6 +28,8 @@ def test_parse_exhibit_number_negative():
     assert gi.parse_exhibit_number("что в зале 3 интересного") is None
     assert gi.parse_exhibit_number("") is None
     assert gi.parse_exhibit_number("яйцо 1885 года") is None
+    # «экспонат12» без пробела НЕ должен разбираться как №2 (жадный \w съедал цифры).
+    assert gi.parse_exhibit_number("экспонат12") is None
 
 
 def test_is_navigational():
@@ -36,6 +38,8 @@ def test_is_navigational():
     assert gi.is_navigational("где находится Ротшильд")
     assert not gi.is_navigational("расскажи историю яйца")
     assert not gi.is_navigational("из чего оно сделано")
+    # Провенанс/прошедшее время — не текущая навигация (иначе location противоречит ответу).
+    assert not gi.is_navigational("где выставлялось это яйцо раньше")
 
 
 def test_is_hall_listing():
@@ -44,6 +48,8 @@ def test_is_hall_listing():
     assert gi.is_hall_listing("перечисли залы")
     assert not gi.is_hall_listing("что в этом зале")
     assert not gi.is_hall_listing("расскажи про яйцо")
+    # Вопрос про ОДИН конкретный зал не должен триггерить дамп всех залов.
+    assert not gi.is_hall_listing("что за зал 5?")
 
 
 if __name__ == "__main__":
