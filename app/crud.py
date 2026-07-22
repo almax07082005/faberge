@@ -385,6 +385,23 @@ async def names_by_slugs(session: AsyncSession, slugs: Sequence[str]) -> Dict[st
     return {slug: name for slug, name in rows.all()}
 
 
+async def slug_by_name(session: AsyncSession) -> Dict[str, str]:
+    """Карта ``name → label_slug`` для сшивки с внешним ML-поиском по фото: сервис
+    распознавания ключует предметы по названию (title), а наш каталог — по
+    label_slug. Имена не уникальны (напр. «Портсигар» ×12) — берём экспонат с
+    наименьшим id детерминированно (первый по order_by id)."""
+    rows = await session.execute(
+        select(m.Exhibit.name, m.Exhibit.label_slug)
+        .where(m.Exhibit.label_slug.isnot(None))
+        .order_by(m.Exhibit.id)
+    )
+    mapping: Dict[str, str] = {}
+    for name, slug in rows.all():
+        if name and name not in mapping:
+            mapping[name] = slug
+    return mapping
+
+
 # ── Поиск и retrieval (B1/B8/C27) ─────────────────────────────────────────────
 # Слой поиска по каталогу, доступный и из GET /search, и из ИИ-гида (retrieval).
 # Каждый запрос — одно условие ``search_vector @@ q OR <ILIKE>``:
