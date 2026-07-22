@@ -35,9 +35,12 @@ async def recognize_exhibit(
         raise HTTPException(status_code=413, detail=f"Размер файла превышает {settings.max_upload_mb} МБ.")
 
     known = await crud.all_label_slugs(session)
+    # Реальный ML-сервис возвращает названия (title); карта имя→slug нужна только
+    # в реал-режиме — в стабе лишний запрос не делаем.
+    name_to_slug = await crud.slug_by_name(session) if settings.yolo_configured else {}
     t0 = time.monotonic()
     try:
-        outcome = await recognizer.recognize(data, known, hall_id, top_k)
+        outcome = await recognizer.recognize(data, known, hall_id, top_k, name_to_slug=name_to_slug)
     except UpstreamError as exc:
         raise HTTPException(status_code=502, detail=exc.message)
     processing_ms = int((time.monotonic() - t0) * 1000)
