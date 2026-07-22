@@ -6,7 +6,8 @@ from collections import Counter, defaultdict
 from datetime import date
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from sqlalchemy import String, and_, cast, delete as sa_delete, func, or_, select, update as sa_update
+from sqlalchemy import String, and_, cast, delete as sa_delete, func, or_, select, text, update as sa_update
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -44,6 +45,7 @@ def to_exhibit_summary(e: m.Exhibit) -> sch.ExhibitSummary:
     hall = e.showcase.hall if e.showcase else None
     return sch.ExhibitSummary(
         id=e.id,
+        exhibit_number=e.exhibit_number,
         label_slug=e.label_slug,
         name=e.name,
         year_created=e.year_created,
@@ -65,6 +67,7 @@ def to_exhibit(e: m.Exhibit, admin: bool = False) -> sch.Exhibit:
     cls = sch.ExhibitAdmin if admin else sch.Exhibit
     data = dict(
         id=e.id,
+        exhibit_number=e.exhibit_number,
         label_slug=e.label_slug,
         name=e.name,
         year_created=e.year_created,
@@ -73,6 +76,7 @@ def to_exhibit(e: m.Exhibit, admin: bool = False) -> sch.Exhibit:
         short_description=e.short_description,
         image_url=e.image_url,
         images=images,
+        video_url=e.video_url,
         model_3d_url=e.model_3d_url,
         model_3d_embed=e.model_3d_embed,
         audio_url=e.audio_url,
@@ -89,6 +93,7 @@ def to_exhibit(e: m.Exhibit, admin: bool = False) -> sch.Exhibit:
 def exhibit_to_dict(e: m.Exhibit) -> Dict:
     return {
         "id": e.id,
+        "exhibit_number": e.exhibit_number,
         "label_slug": e.label_slug,
         "name": e.name,
         "year_created": e.year_created,
@@ -97,6 +102,36 @@ def exhibit_to_dict(e: m.Exhibit) -> Dict:
         "short_description": e.short_description,
         "raw_history": e.raw_history,
     }
+
+
+# ── Сериализаторы для ответов ИИ-гида (B6/B7/B10) ─────────────────────────────
+def to_referenced_exhibit(e: m.Exhibit) -> sch.ReferencedExhibit:
+    """Плашка экспоната для ответа гида (B6): id, название, миниатюра, где лежит."""
+    hall = e.showcase.hall if e.showcase else None
+    return sch.ReferencedExhibit(
+        id=e.id,
+        name=e.name,
+        exhibit_number=e.exhibit_number,
+        thumbnail_url=e.image_url,
+        hall_number=hall.hall_number if hall else None,
+        showcase_number=e.showcase.showcase_number if e.showcase else None,
+    )
+
+
+def to_referenced_hall(h: m.Hall) -> sch.ReferencedHall:
+    return sch.ReferencedHall(id=h.id, hall_number=h.hall_number, name=h.name)
+
+
+def to_location(e: m.Exhibit) -> Optional[sch.GuideLocation]:
+    """Навигация «зал + витрина» (B7). None, если экспонат не привязан к витрине."""
+    if e.showcase is None:
+        return None
+    hall = e.showcase.hall
+    return sch.GuideLocation(
+        hall_number=hall.hall_number if hall else None,
+        hall_name=hall.name if hall else None,
+        showcase_number=e.showcase.showcase_number,
+    )
 
 
 # ── Загрузчики с нужными relationship ────────────────────────────────────────
@@ -351,26 +386,122 @@ async def names_by_slugs(session: AsyncSession, slugs: Sequence[str]) -> Dict[st
     return {slug: name for slug, name in rows.all()}
 
 
-# ── Поиск ────────────────────────────────────────────────────────────────────
-async def search(session: AsyncSession, q: str, limit: int) -> sch.SearchResponse:
+# ── Поиск и retrieval (B1/B8/C27) ─────────────────────────────────────────────
+# Слой поиска по каталогу, доступный и из GET /search, и из ИИ-гида (retrieval).
+# Первичный путь — полнотекстовый поиск PostgreSQL по search_vector с ранжированием
+# (ts_rank); дополнительно ILIKE-подстрока ловит частичные совпадения (напр.
+# «коронац» без полного слова). Если колонки search_vector ещё нет (миграция не
+# применена на живой БД — см. заметку про дрейф), падаем в чистый ILIKE, чтобы
+# поиск продолжал работать.
+def _exhibit_ilike(q: str):
     like = f"%{q}%"
-    halls = (
-        (await session.execute(select(m.Hall).where(or_(m.Hall.name.ilike(like), m.Hall.description.ilike(like))).order_by(m.Hall.hall_number).limit(limit)))
-        .scalars()
-        .all()
+    return or_(
+        m.Exhibit.name.ilike(like),
+        m.Exhibit.master_name.ilike(like),
+        m.Exhibit.short_description.ilike(like),
+        m.Exhibit.raw_history.ilike(like),
+        m.Exhibit.exhibit_number.ilike(like),
     )
-    exhibits = (
-        (
-            await session.execute(
-                select(m.Exhibit).options(*_EXHIBIT_SUMMARY).where(or_(m.Exhibit.name.ilike(like), m.Exhibit.master_name.ilike(like))).order_by(m.Exhibit.id).limit(limit)
+
+
+def _hall_ilike(q: str):
+    like = f"%{q}%"
+    return or_(m.Hall.name.ilike(like), m.Hall.description.ilike(like))
+
+
+def _ru_tsquery(q: str):
+    """OR-tsquery из свободного текста запроса.
+
+    ``plainto_tsquery`` соединяет слова через AND, поэтому целая фраза («расскажи
+    про коронационное яйцо») почти никогда не матчится. Для retrieval нужна
+    OR-семантика: совпало любое значимое слово, а ``ts_rank`` поднимает документы
+    с бОльшим числом совпадений. Превращаем '&' в '|' на уровне текста tsquery
+    (безопасно: plainto_tsquery не создаёт фраз/операторов, только '&').
+    Один объект переиспользуется в WHERE и ORDER BY одного запроса.
+    """
+    return text("replace(plainto_tsquery('russian', :ftsq)::text, ' & ', ' | ')::tsquery").bindparams(ftsq=q)
+
+
+async def search_exhibits_orm(session: AsyncSession, q: str, limit: int) -> List[m.Exhibit]:
+    """ORM-экспонаты по запросу: FTS-ранжирование + ILIKE-фолбэк. Загружает зал/витрину.
+
+    FTS-попытка обёрнута в SAVEPOINT: если колонки search_vector нет (миграция не
+    применена), откатывается только savepoint, а внешняя транзакция запроса (напр.
+    только что созданная guide-сессия) остаётся живой — падаем в чистый ILIKE.
+    """
+    tsq = _ru_tsquery(q)
+    try:
+        async with session.begin_nested():
+            stmt = (
+                select(m.Exhibit)
+                .options(*_EXHIBIT_SUMMARY)
+                .where(or_(m.Exhibit.search_vector.op("@@")(tsq), _exhibit_ilike(q)))
+                .order_by(func.ts_rank(m.Exhibit.search_vector, tsq).desc(), m.Exhibit.id)
+                .limit(limit)
             )
+            return list((await session.execute(stmt)).scalars().all())
+    except DBAPIError:
+        stmt = (
+            select(m.Exhibit).options(*_EXHIBIT_SUMMARY).where(_exhibit_ilike(q)).order_by(m.Exhibit.id).limit(limit)
         )
-        .scalars()
-        .all()
-    )
+        return list((await session.execute(stmt)).scalars().all())
+
+
+async def search_halls_orm(session: AsyncSession, q: str, limit: int) -> List[m.Hall]:
+    tsq = _ru_tsquery(q)
+    try:
+        async with session.begin_nested():
+            stmt = (
+                select(m.Hall)
+                .where(or_(m.Hall.search_vector.op("@@")(tsq), _hall_ilike(q)))
+                .order_by(func.ts_rank(m.Hall.search_vector, tsq).desc(), m.Hall.hall_number)
+                .limit(limit)
+            )
+            return list((await session.execute(stmt)).scalars().all())
+    except DBAPIError:
+        stmt = select(m.Hall).where(_hall_ilike(q)).order_by(m.Hall.hall_number).limit(limit)
+        return list((await session.execute(stmt)).scalars().all())
+
+
+async def search(session: AsyncSession, q: str, limit: int) -> sch.SearchResponse:
+    halls = await search_halls_orm(session, q, limit)
+    exhibits = await search_exhibits_orm(session, q, limit)
     hall_items = [to_hall(h) for h in halls]
     exhibit_items = [to_exhibit_summary(e) for e in exhibits]
     return sch.SearchResponse(query=q, halls=hall_items, exhibits=exhibit_items, total=len(hall_items) + len(exhibit_items))
+
+
+# ── Retrieval для ИИ-гида (B1) ────────────────────────────────────────────────
+# Единый слой доступа гида к каталогу: поиск экспонатов/залов и точечные выборки
+# (по номеру — B9, весь список залов — B10). Возвращает ORM-объекты, которые роутер
+# гида сериализует в referenced_exhibits / referenced_halls / location.
+async def exhibits_by_number(session: AsyncSession, number: str) -> List[m.Exhibit]:
+    """Экспонаты с данным номером по путеводителю (B9). Номер не уникален — их может
+    быть несколько (тогда гид уточняет зал/витрину)."""
+    num = number.strip()
+    stmt = (
+        select(m.Exhibit)
+        .options(*_EXHIBIT_SUMMARY)
+        .where(func.lower(m.Exhibit.exhibit_number) == num.lower())
+        .order_by(m.Exhibit.showcase_id, m.Exhibit.id)
+    )
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def all_halls_ordered(session: AsyncSession) -> List[m.Hall]:
+    """Все залы в порядке каталога (B10): для ответа «какие залы есть»."""
+    stmt = select(m.Hall).order_by(m.Hall.sort_order, m.Hall.hall_number)
+    return list((await session.execute(stmt)).scalars().all())
+
+
+async def candidates_by_slugs(session: AsyncSession, slugs: Sequence[str]) -> Dict[str, Tuple[int, Optional[str]]]:
+    """slug → (exhibit_id, thumbnail_url) для карточек кандидатов распознавания (B5)."""
+    if not slugs:
+        return {}
+    rows = await session.execute(
+        select(m.Exhibit.label_slug, m.Exhibit.id, m.Exhibit.image_url).where(m.Exhibit.label_slug.in_(list(slugs)))
+    )
+    return {slug: (ex_id, image_url) for slug, ex_id, image_url in rows.all()}
 
 
 # ── Администрирование (CRUD) ─────────────────────────────────────────────────
@@ -457,6 +588,17 @@ async def create_showcase(session: AsyncSession, data: sch.ShowcaseCreate) -> sc
 
 async def get_showcase_orm(session: AsyncSession, showcase_id: int) -> Optional[m.Showcase]:
     return (await session.execute(select(m.Showcase).where(m.Showcase.id == showcase_id))).scalar_one_or_none()
+
+
+async def patch_showcase(session: AsyncSession, sc: m.Showcase, data: sch.ShowcasePatch) -> sch.ShowcaseDetail:
+    """Частичное обновление витрины (B2). Уникальность (hall_id, showcase_number)
+    проверяет БД — IntegrityError ловит роутер и отдаёт 409."""
+    for field, value in data.model_dump(exclude_unset=True).items():
+        setattr(sc, field, value)
+    await session.commit()
+    result = await get_showcase(session, sc.id)
+    assert result is not None
+    return result
 
 
 # ── Удаление залов / витрин (каскад + очистка медиа) ─────────────────────────

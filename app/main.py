@@ -56,7 +56,7 @@ tags_metadata = [
     {"name": "ИИ-гид", "description": "Рассказ (YandexGPT) и диалог с подсказками."},
     {"name": "Озвучивание", "description": "Синтез речи (SpeechKit)."},
     {"name": "Администрирование", "description": "[Вне MVP] CRUD и аналитика (Bearer)."},
-    {"name": "Телеметрия", "description": "[Вне MVP] Приём событий для аналитики."},
+    {"name": "Телеметрия", "description": "Приём событий для аналитики (обязательный контракт с 21.07.2026)."},
 ]
 
 app = FastAPI(

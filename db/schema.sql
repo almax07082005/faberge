@@ -34,7 +34,12 @@ CREATE TABLE IF NOT EXISTS halls (
     is_temporary    BOOLEAN NOT NULL DEFAULT false,  -- зал временной выставки (vs основная экспозиция)
     sort_order      INT NOT NULL DEFAULT 0,     -- порядок вывода залов в каталоге/админке (drag-n-drop)
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Полнотекстовый вектор поиска (B8/C27): русская конфигурация, name важнее описания.
+    search_vector   tsvector GENERATED ALWAYS AS (
+        setweight(to_tsvector('russian', coalesce(name,'')), 'A') ||
+        setweight(to_tsvector('russian', coalesce(description,'')), 'C')
+    ) STORED
 );
 
 -- Идемпотентная миграция для уже существующих БД (CREATE TABLE IF NOT EXISTS выше
@@ -42,6 +47,10 @@ CREATE TABLE IF NOT EXISTS halls (
 -- безопасен: столбец добавляется только при отсутствии.
 ALTER TABLE halls ADD COLUMN IF NOT EXISTS is_temporary BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE halls ADD COLUMN IF NOT EXISTS sort_order   INT NOT NULL DEFAULT 0;
+ALTER TABLE halls ADD COLUMN IF NOT EXISTS search_vector tsvector GENERATED ALWAYS AS (
+    setweight(to_tsvector('russian', coalesce(name,'')), 'A') ||
+    setweight(to_tsvector('russian', coalesce(description,'')), 'C')
+) STORED;
 
 -- Бэкофилл порядка для залов, которым его ещё не задавали (sort_order = 0):
 -- берём hall_number как естественный первичный порядок. Reorder присваивает
@@ -64,6 +73,7 @@ CREATE TABLE IF NOT EXISTS exhibits (
     id                SERIAL PRIMARY KEY,
     showcase_id       INT REFERENCES showcases(id) ON DELETE CASCADE,
     label_slug        VARCHAR(100) UNIQUE,      -- класс, который возвращает YOLO
+    exhibit_number    VARCHAR(32),              -- номер по путеводителю музея (B3): перед названием в каталоге
     name              VARCHAR(255) NOT NULL,
     year_created      INT,
     master_name       VARCHAR(255),
@@ -72,16 +82,35 @@ CREATE TABLE IF NOT EXISTS exhibits (
     short_description_spoken TEXT,              -- версия short_description для TTS: числа прописью в нужном падеже (LLM)
     raw_history       TEXT,                     -- внутренние факты для YandexGPT
     image_url         TEXT,
+    video_url         TEXT,                     -- видео экспоната (B4/C22)
     model_3d_url      TEXT,                     -- ссылка на 3D-модель Koinovo
     model_3d_embed    TEXT,
     audio_url         TEXT,                     -- предсинтезированная озвучка
     source_url        TEXT,
     created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Полнотекстовый вектор поиска (B8/C27): русская конфигурация, взвешенная по
+    -- важности поля (name=A ... raw_history=D). Покрывает short_description и
+    -- raw_history — там упоминается, напр., Николай II. Все функции immutable.
+    search_vector     tsvector GENERATED ALWAYS AS (
+        setweight(to_tsvector('russian', coalesce(name,'')), 'A') ||
+        setweight(to_tsvector('russian', coalesce(master_name,'') || ' ' || coalesce(exhibit_number,'')), 'B') ||
+        setweight(to_tsvector('russian', coalesce(short_description,'')), 'C') ||
+        setweight(to_tsvector('russian', coalesce(raw_history,'')), 'D')
+    ) STORED
 );
 
 -- Идемпотентная миграция для существующих БД (см. пояснение у halls выше).
+-- Порядок важен: exhibit_number добавляем ДО search_vector (вектор на него ссылается).
 ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS short_description_spoken TEXT;
+ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS exhibit_number VARCHAR(32);
+ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS video_url TEXT;
+ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS search_vector tsvector GENERATED ALWAYS AS (
+    setweight(to_tsvector('russian', coalesce(name,'')), 'A') ||
+    setweight(to_tsvector('russian', coalesce(master_name,'') || ' ' || coalesce(exhibit_number,'')), 'B') ||
+    setweight(to_tsvector('russian', coalesce(short_description,'')), 'C') ||
+    setweight(to_tsvector('russian', coalesce(raw_history,'')), 'D')
+) STORED;
 
 -- Галерея изображений экспоната ----------------------------------------------
 CREATE TABLE IF NOT EXISTS exhibit_images (
@@ -134,6 +163,9 @@ CREATE INDEX IF NOT EXISTS idx_halls_name_trgm      ON halls    USING gin (name 
 CREATE INDEX IF NOT EXISTS idx_halls_is_temporary    ON halls(is_temporary);
 CREATE INDEX IF NOT EXISTS idx_halls_sort_order      ON halls(sort_order);
 CREATE INDEX IF NOT EXISTS idx_exhibits_name_trgm   ON exhibits USING gin (name gin_trgm_ops);
+-- Полнотекстовый поиск (B8/C27): GIN по сгенерированным tsvector-колонкам.
+CREATE INDEX IF NOT EXISTS idx_halls_search         ON halls    USING gin (search_vector);
+CREATE INDEX IF NOT EXISTS idx_exhibits_search      ON exhibits USING gin (search_vector);
 
 -- Триггеры updated_at --------------------------------------------------------
 DROP TRIGGER IF EXISTS trg_halls_updated     ON halls;

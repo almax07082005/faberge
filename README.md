@@ -117,8 +117,8 @@ Dockerfile, docker-compose.yml, .env.example
 | Озвучивание | `POST /speech` (SpeechKit) |
 | Админ · вход | `POST /admin/login` (логин/пароль → Bearer-токен; открытый) |
 | Админ · медиа | `GET`/`POST /admin/exhibits/{id}/media`, `DELETE /admin/exhibits/{id}/media/{image_id}`, `POST /admin/halls/{id}/cover` |
-| Администрирование* | CRUD `/admin/exhibits`, `/admin/halls`, `PATCH /admin/halls/{id}`, `/admin/showcases`, `/admin/analytics/overview` |
-| Телеметрия* | `POST /telemetry/events` |
+| Администрирование* | CRUD `/admin/exhibits`, `/admin/halls`, `PATCH /admin/halls/{id}`, `/admin/showcases`, `PATCH /admin/showcases/{id}`, `/admin/analytics/overview` |
+| Телеметрия | `POST /telemetry/events` (обязательный контракт с 21.07.2026 — источник аналитики) |
 
 \* — вне MVP; защищено `bearerAuth` (заголовок `Authorization: Bearer <token>`, токен — из `POST /admin/login` или `ADMIN_API_TOKEN`). Загрузка медиа/обложек и вход — рабочие (в MVP): размер ≤ `MAX_UPLOAD_MB` (10 МБ), форматы JPEG/PNG/WebP; `thumbnail_url` совпадает с `image_url` (отдельная миниатюра не генерируется).
 

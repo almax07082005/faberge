@@ -9,6 +9,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Computed,
     ForeignKey,
     Integer,
     String,
@@ -16,13 +17,29 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import DateTime
 
 
 class Base(DeclarativeBase):
     pass
+
+
+# Полнотекстовый вектор для поиска (B8/C27): русская конфигурация, взвешенная по
+# важности поля. Выражения ДОЛЖНЫ совпадать с db/schema.sql (GENERATED-колонка),
+# иначе поиск и индекс разойдутся. Все функции immutable → допустимо в GENERATED.
+_HALL_TSV = (
+    "setweight(to_tsvector('russian', coalesce(name,'')), 'A') || "
+    "setweight(to_tsvector('russian', coalesce(description,'')), 'C')"
+)
+_EXHIBIT_TSV = (
+    "setweight(to_tsvector('russian', coalesce(name,'')), 'A') || "
+    "setweight(to_tsvector('russian', "
+    "coalesce(master_name,'') || ' ' || coalesce(exhibit_number,'')), 'B') || "
+    "setweight(to_tsvector('russian', coalesce(short_description,'')), 'C') || "
+    "setweight(to_tsvector('russian', coalesce(raw_history,'')), 'D')"
+)
 
 
 class Hall(Base):
@@ -38,6 +55,13 @@ class Hall(Base):
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Полнотекстовый вектор (B8): БД генерирует его сама (GENERATED ALWAYS ... STORED),
+    # поэтому колонка read-only (Computed) и отложенная (deferred — не тянем tsvector в
+    # обычные SELECT). Используется в crud.search / retrieval для ранжирования.
+    search_vector: Mapped[Optional[str]] = mapped_column(
+        TSVECTOR, Computed(_HALL_TSV, persisted=True), nullable=True, deferred=True
+    )
 
     showcases: Mapped[List["Showcase"]] = relationship(
         back_populates="hall", cascade="all, delete-orphan", order_by="Showcase.showcase_number"
@@ -67,6 +91,9 @@ class Exhibit(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     showcase_id: Mapped[Optional[int]] = mapped_column(ForeignKey("showcases.id", ondelete="CASCADE"))
     label_slug: Mapped[Optional[str]] = mapped_column(String(100), unique=True)
+    # Номер экспоната по путеводителю музея (B3): показывается перед названием в
+    # каталоге. Строка (а не INT), т.к. в путеводителе встречаются номера вида «12а».
+    exhibit_number: Mapped[Optional[str]] = mapped_column(String(32))
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     year_created: Mapped[Optional[int]] = mapped_column(Integer)
     master_name: Mapped[Optional[str]] = mapped_column(String(255))
@@ -75,12 +102,18 @@ class Exhibit(Base):
     short_description_spoken: Mapped[Optional[str]] = mapped_column(Text)
     raw_history: Mapped[Optional[str]] = mapped_column(Text)
     image_url: Mapped[Optional[str]] = mapped_column(Text)
+    video_url: Mapped[Optional[str]] = mapped_column(Text)  # видео экспоната (B4/C22)
     model_3d_url: Mapped[Optional[str]] = mapped_column(Text)
     model_3d_embed: Mapped[Optional[str]] = mapped_column(Text)
     audio_url: Mapped[Optional[str]] = mapped_column(Text)
     source_url: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Полнотекстовый вектор (B8) — см. пояснение у Hall.search_vector.
+    search_vector: Mapped[Optional[str]] = mapped_column(
+        TSVECTOR, Computed(_EXHIBIT_TSV, persisted=True), nullable=True, deferred=True
+    )
 
     showcase: Mapped[Optional["Showcase"]] = relationship(back_populates="exhibits")
     images: Mapped[List["ExhibitImage"]] = relationship(
