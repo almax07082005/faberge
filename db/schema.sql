@@ -26,12 +26,15 @@ $$ LANGUAGE plpgsql;
 -- Залы -----------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS halls (
     id              SERIAL PRIMARY KEY,
-    hall_number     INT  NOT NULL UNIQUE,
+    -- NULL — зал без номера («Вне постоянной экспозиции»): в подписях и в ответах
+    -- гида он выводится только по названию, без «зал № …».
+    hall_number     INT  UNIQUE,
     name            VARCHAR(255),
     description     TEXT,                       -- описание зала (план/путеводитель)
     level           INT,                        -- этаж/уровень в здании
     cover_image_url TEXT,
     is_temporary    BOOLEAN NOT NULL DEFAULT false,  -- зал временной выставки (vs основная экспозиция)
+    is_service      BOOLEAN NOT NULL DEFAULT false,  -- служебная запись (Парадная лестница): скрыта из публичной выдачи
     sort_order      INT NOT NULL DEFAULT 0,     -- порядок вывода залов в каталоге/админке (drag-n-drop)
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -46,7 +49,9 @@ CREATE TABLE IF NOT EXISTS halls (
 -- не добавит колонку к таблице, созданной ранее). Повторный запуск init_db.py
 -- безопасен: столбец добавляется только при отсутствии.
 ALTER TABLE halls ADD COLUMN IF NOT EXISTS is_temporary BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE halls ADD COLUMN IF NOT EXISTS is_service   BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE halls ADD COLUMN IF NOT EXISTS sort_order   INT NOT NULL DEFAULT 0;
+ALTER TABLE halls ALTER COLUMN hall_number DROP NOT NULL;
 ALTER TABLE halls ADD COLUMN IF NOT EXISTS search_vector tsvector GENERATED ALWAYS AS (
     setweight(to_tsvector('russian', coalesce(name,'')), 'A') ||
     setweight(to_tsvector('russian', coalesce(description,'')), 'C')
@@ -55,18 +60,29 @@ ALTER TABLE halls ADD COLUMN IF NOT EXISTS search_vector tsvector GENERATED ALWA
 -- Бэкофилл порядка для залов, которым его ещё не задавали (sort_order = 0):
 -- берём hall_number как естественный первичный порядок. Reorder присваивает
 -- значения 1..N, поэтому переставленные админом залы сюда уже не попадут.
-UPDATE halls SET sort_order = hall_number WHERE sort_order = 0;
+-- Залы без номера пропускаем — sort_order NOT NULL, им порядок ставит бэкенд
+-- (crud.create_hall) или админ вручную.
+UPDATE halls SET sort_order = hall_number WHERE sort_order = 0 AND hall_number IS NOT NULL;
 
 -- Витрины --------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS showcases (
     id              SERIAL PRIMARY KEY,
     hall_id         INT NOT NULL REFERENCES halls(id) ON DELETE CASCADE,
-    showcase_number INT NOT NULL,
+    -- NULL — группа «не в витринах» (в путеводителе отмечена пустым квадратом):
+    -- экспонаты зала, стоящие вне витрин.
+    showcase_number INT,
     name            VARCHAR(255),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     UNIQUE (hall_id, showcase_number)
 );
+
+-- Идемпотентная миграция для существующих БД (см. пояснение у halls выше).
+ALTER TABLE showcases ALTER COLUMN showcase_number DROP NOT NULL;
+-- UNIQUE(hall_id, showcase_number) не ограничивает строки с NULL, поэтому группу
+-- «не в витринах» держим единственной в зале отдельным частичным индексом.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_showcases_hall_unnumbered
+    ON showcases (hall_id) WHERE showcase_number IS NULL;
 
 -- Экспонаты ------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS exhibits (
@@ -161,6 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_events_type_ts       ON events(type, ts);
 CREATE INDEX IF NOT EXISTS idx_events_session_ts    ON events(session_id, ts);  -- аналитика по сессиям (C17/C18)
 CREATE INDEX IF NOT EXISTS idx_halls_name_trgm      ON halls    USING gin (name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_halls_is_temporary    ON halls(is_temporary);
+CREATE INDEX IF NOT EXISTS idx_halls_is_service      ON halls(is_service);
 CREATE INDEX IF NOT EXISTS idx_halls_sort_order      ON halls(sort_order);
 CREATE INDEX IF NOT EXISTS idx_exhibits_name_trgm   ON exhibits USING gin (name gin_trgm_ops);
 -- Полнотекстовый поиск (B8/C27): GIN по сгенерированным tsvector-колонкам.

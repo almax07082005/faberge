@@ -6,7 +6,18 @@ from collections import Counter, defaultdict
 from datetime import date
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from sqlalchemy import String, and_, cast, delete as sa_delete, func, or_, select, text, update as sa_update
+from sqlalchemy import (
+    String,
+    and_,
+    cast,
+    delete as sa_delete,
+    func,
+    nullslast,
+    or_,
+    select,
+    text,
+    update as sa_update,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -24,6 +35,7 @@ def to_hall(h: m.Hall, showcase_count: Optional[int] = None, exhibit_count: Opti
         level=h.level,
         cover_image_url=h.cover_image_url,
         is_temporary=h.is_temporary,
+        is_service=h.is_service,
         sort_order=h.sort_order,
         showcase_count=showcase_count,
         exhibit_count=exhibit_count,
@@ -52,6 +64,7 @@ def to_exhibit_summary(e: m.Exhibit) -> sch.ExhibitSummary:
         thumbnail_url=e.image_url,
         hall_id=hall.id if hall else None,
         showcase_id=e.showcase_id,
+        showcase_number=e.showcase.showcase_number if e.showcase else None,
         is_temporary=hall.is_temporary if hall else None,
     )
 
@@ -171,10 +184,28 @@ async def _showcase_exhibit_counts(session: AsyncSession, showcase_ids: Sequence
 
 
 # ── Карта / навигация ────────────────────────────────────────────────────────
-async def get_map(session: AsyncSession, is_temporary: Optional[bool] = None) -> sch.MapResponse:
-    stmt = select(m.Hall).options(selectinload(m.Hall.showcases)).order_by(m.Hall.sort_order, m.Hall.hall_number)
+# Порядок залов: sort_order, затем номер. Залы без номера («Вне постоянной
+# экспозиции») идут последними — nullslast. Служебные записи (Парадная лестница)
+# в публичную выдачу не попадают: источник правды один, скрывать их на клиенте
+# нельзя (баг-репорт 28.07.2026, п.5).
+_HALL_ORDER = (m.Hall.sort_order, nullslast(m.Hall.hall_number.asc()))
+# Витрины: по номеру, а группа «не в витринах» (showcase_number IS NULL) — последней.
+_SHOWCASE_ORDER = nullslast(m.Showcase.showcase_number.asc())
+
+
+def _hall_visibility(stmt, is_temporary: Optional[bool], include_service: bool):
     if is_temporary is not None:
         stmt = stmt.where(m.Hall.is_temporary == is_temporary)
+    if not include_service:
+        stmt = stmt.where(m.Hall.is_service.is_(False))
+    return stmt
+
+
+async def get_map(
+    session: AsyncSession, is_temporary: Optional[bool] = None, include_service: bool = False
+) -> sch.MapResponse:
+    stmt = select(m.Hall).options(selectinload(m.Hall.showcases)).order_by(*_HALL_ORDER)
+    stmt = _hall_visibility(stmt, is_temporary, include_service)
     halls = (await session.execute(stmt)).scalars().all()
     hall_ids = [h.id for h in halls]
     showcase_counts, exhibit_counts = await _hall_counts(session, hall_ids)
@@ -193,8 +224,8 @@ async def get_map(session: AsyncSession, is_temporary: Optional[bool] = None) ->
         map_halls.append(
             sch.MapHall(
                 id=h.id, hall_number=h.hall_number, name=h.name, description=h.description, level=h.level,
-                cover_image_url=h.cover_image_url, is_temporary=h.is_temporary, sort_order=h.sort_order,
-                showcase_count=showcase_counts.get(h.id, 0),
+                cover_image_url=h.cover_image_url, is_temporary=h.is_temporary, is_service=h.is_service,
+                sort_order=h.sort_order, showcase_count=showcase_counts.get(h.id, 0),
                 exhibit_count=exhibit_counts.get(h.id, 0), showcases=showcases,
             )
         )
@@ -202,13 +233,13 @@ async def get_map(session: AsyncSession, is_temporary: Optional[bool] = None) ->
 
 
 async def list_halls(
-    session: AsyncSession, limit: int, offset: int, is_temporary: Optional[bool] = None
+    session: AsyncSession, limit: int, offset: int, is_temporary: Optional[bool] = None,
+    include_service: bool = False,
 ) -> sch.HallListResponse:
-    count_stmt = select(func.count(m.Hall.id))
-    list_stmt = select(m.Hall).order_by(m.Hall.sort_order, m.Hall.hall_number)
-    if is_temporary is not None:
-        count_stmt = count_stmt.where(m.Hall.is_temporary == is_temporary)
-        list_stmt = list_stmt.where(m.Hall.is_temporary == is_temporary)
+    count_stmt = _hall_visibility(select(func.count(m.Hall.id)), is_temporary, include_service)
+    list_stmt = _hall_visibility(
+        select(m.Hall).order_by(*_HALL_ORDER), is_temporary, include_service
+    )
     total = (await session.execute(count_stmt)).scalar_one()
     halls = (await session.execute(list_stmt.limit(limit).offset(offset))).scalars().all()
     showcase_counts, exhibit_counts = await _hall_counts(session, [h.id for h in halls])
@@ -227,8 +258,8 @@ async def get_hall(session: AsyncSession, hall_id: int) -> Optional[sch.HallDeta
     showcases = [to_showcase(s, sc_ex_counts.get(s.id, 0)) for s in hall.showcases]
     return sch.HallDetail(
         id=hall.id, hall_number=hall.hall_number, name=hall.name, description=hall.description, level=hall.level,
-        cover_image_url=hall.cover_image_url, is_temporary=hall.is_temporary, sort_order=hall.sort_order,
-        showcase_count=showcase_counts.get(hall.id, 0),
+        cover_image_url=hall.cover_image_url, is_temporary=hall.is_temporary, is_service=hall.is_service,
+        sort_order=hall.sort_order, showcase_count=showcase_counts.get(hall.id, 0),
         exhibit_count=exhibit_counts.get(hall.id, 0), showcases=showcases,
     )
 
@@ -242,7 +273,7 @@ async def list_hall_showcases(session: AsyncSession, hall_id: int, limit: int, o
     showcases = (
         (
             await session.execute(
-                select(m.Showcase).where(m.Showcase.hall_id == hall_id).order_by(m.Showcase.showcase_number).limit(limit).offset(offset)
+                select(m.Showcase).where(m.Showcase.hall_id == hall_id).order_by(_SHOWCASE_ORDER).limit(limit).offset(offset)
             )
         )
         .scalars()
@@ -258,7 +289,7 @@ async def list_showcases(
 ) -> sch.ShowcaseListResponse:
     flt = (m.Showcase.hall_id == hall_id) if hall_id is not None else None
     count_stmt = select(func.count(m.Showcase.id))
-    list_stmt = select(m.Showcase).order_by(m.Showcase.hall_id, m.Showcase.showcase_number)
+    list_stmt = select(m.Showcase).order_by(m.Showcase.hall_id, _SHOWCASE_ORDER)
     if flt is not None:
         count_stmt = count_stmt.where(flt)
         list_stmt = list_stmt.where(flt)
@@ -459,7 +490,7 @@ async def search_halls_orm(session: AsyncSession, q: str, limit: int) -> List[m.
     stmt = (
         select(m.Hall)
         .where(or_(m.Hall.search_vector.op("@@")(tsq), _hall_ilike(q)))
-        .order_by(func.ts_rank(m.Hall.search_vector, tsq).desc(), m.Hall.hall_number)
+        .order_by(func.ts_rank(m.Hall.search_vector, tsq).desc(), nullslast(m.Hall.hall_number.asc()))
         .limit(limit)
     )
     return list((await session.execute(stmt)).scalars().all())
@@ -490,9 +521,13 @@ async def exhibits_by_number(session: AsyncSession, number: str) -> List[m.Exhib
     return list((await session.execute(stmt)).scalars().all())
 
 
-async def all_halls_ordered(session: AsyncSession) -> List[m.Hall]:
-    """Все залы в порядке каталога (B10): для ответа «какие залы есть»."""
-    stmt = select(m.Hall).order_by(m.Hall.sort_order, m.Hall.hall_number)
+async def all_halls_ordered(session: AsyncSession, include_service: bool = False) -> List[m.Hall]:
+    """Залы в порядке каталога (B10): для ответа «какие залы есть».
+
+    Служебные записи (Парадная лестница) по умолчанию исключены — гид не должен
+    называть их посетителю, а «В музее N залов» обязан сойтись с GET /halls.
+    """
+    stmt = _hall_visibility(select(m.Hall).order_by(*_HALL_ORDER), None, include_service)
     return list((await session.execute(stmt)).scalars().all())
 
 
@@ -508,12 +543,19 @@ async def candidates_by_slugs(session: AsyncSession, slugs: Sequence[str]) -> Di
 
 # ── Администрирование (CRUD) ─────────────────────────────────────────────────
 async def create_hall(session: AsyncSession, data: sch.HallCreate) -> sch.HallDetail:
-    hall = m.Hall(
-        hall_number=data.hall_number, name=data.name, description=data.description,
-        level=data.level, is_temporary=data.is_temporary,
+    if data.sort_order is not None:
+        sort_order = data.sort_order
+    elif data.hall_number is not None:
         # По умолчанию порядок = номер зала (новый зал встаёт в конец естественного
         # порядка); админ переставит через reorder / PATCH sort_order.
-        sort_order=data.sort_order if data.sort_order is not None else data.hall_number,
+        sort_order = data.hall_number
+    else:
+        # Зал без номера — в самый конец каталога.
+        sort_order = ((await session.execute(select(func.max(m.Hall.sort_order)))).scalar() or 0) + 1
+    hall = m.Hall(
+        hall_number=data.hall_number, name=data.name, description=data.description,
+        level=data.level, is_temporary=data.is_temporary, is_service=data.is_service,
+        sort_order=sort_order,
     )
     session.add(hall)
     await session.commit()

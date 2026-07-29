@@ -107,7 +107,9 @@ async def reorder_halls(
         await crud.reorder_halls(session, data.hall_ids)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
-    return await crud.list_halls(session, limit=1000, offset=0)
+    # Админке нужен полный каталог, включая служебные записи, — иначе зал,
+    # помеченный служебным, исчезнет из её списка и станет неуправляемым.
+    return await crud.list_halls(session, limit=1000, offset=0, include_service=True)
 
 
 @router.post(

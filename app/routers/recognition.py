@@ -1,6 +1,7 @@
 """Распознавание экспоната по фото (YOLO)."""
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from typing import Optional
@@ -15,6 +16,7 @@ from ..db import get_session
 from ..services import UpstreamError, recognizer
 
 router = APIRouter(tags=["Распознавание"])
+logger = logging.getLogger(__name__)
 
 _ALLOWED = {"image/jpeg", "image/png", "image/webp"}
 
@@ -44,6 +46,21 @@ async def recognize_exhibit(
     except UpstreamError as exc:
         raise HTTPException(status_code=502, detail=exc.message)
     processing_ms = int((time.monotonic() - t0) * 1000)
+
+    # E19: пустой список кандидатов — это для посетителя глухая ошибка «не удалось
+    # распознать». Если модель что-то нашла, но название не сшилось с каталогом,
+    # добираем кандидатов полнотекстовым поиском по этим названиям — фронт покажет
+    # топ-3 «возможно, это». Уверенность берём модели: она про фото, а не про то,
+    # насколько наш поиск угадал карточку.
+    if not outcome.candidates and outcome.unmatched:
+        query = " ".join(title for title, _ in outcome.unmatched if title).strip()
+        found = await crud.search_exhibits_orm(session, query, limit=top_k) if query else []
+        fallback_conf = outcome.unmatched[0][1]
+        outcome.candidates = [(e.label_slug, fallback_conf) for e in found if e.label_slug]
+        logger.info(
+            "recognition: кандидаты добраны поиском по каталогу для %r → %s",
+            query, [slug for slug, _ in outcome.candidates],
+        )
 
     exhibit = None
     if outcome.recognized and outcome.label_slug:

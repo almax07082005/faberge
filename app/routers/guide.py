@@ -18,6 +18,19 @@ router = APIRouter(prefix="/guide", tags=["ИИ-гид"])
 
 
 # ── Вспомогательные (детерминированные ответы гида по каталогу) ───────────────
+def _hall_phrase(hall: m.Hall, case: str = "nom") -> str:
+    """«зал 3 «Синяя гостиная»» / «зале 3 «Синяя гостиная»» (для «в зале …»).
+
+    У залов без номера («Вне постоянной экспозиции») `hall_number` пуст — «зал
+    None» посетителю показывать нельзя (баг-репорт 28.07.2026, п.5).
+    """
+    word = "зале" if case == "prep" else "зал"
+    name = f" «{hall.name}»" if hall.name else ""
+    if hall.hall_number is None:
+        return f"{word}{name}" if name else word
+    return f"{word} {hall.hall_number}{name}"
+
+
 def _location_phrase(ex: m.Exhibit) -> str:
     """«в зале 3 «Синяя гостиная», витрина 2» — из привязки экспоната."""
     if ex.showcase is None:
@@ -25,8 +38,12 @@ def _location_phrase(ex: m.Exhibit) -> str:
     hall = ex.showcase.hall
     parts = []
     if hall is not None:
-        parts.append(f"в зале {hall.hall_number}" + (f" «{hall.name}»" if hall.name else ""))
-    parts.append(f"витрина {ex.showcase.showcase_number}")
+        parts.append("в " + _hall_phrase(hall, case="prep"))
+    # showcase_number = NULL — группа «не в витринах» (пустой квадрат в путеводителе).
+    parts.append(
+        f"витрина {ex.showcase.showcase_number}" if ex.showcase.showcase_number is not None
+        else "вне витрин"
+    )
     return ", ".join(parts)
 
 
@@ -42,21 +59,40 @@ def _describe_exhibit(ex: m.Exhibit) -> str:
     return text
 
 
+def _plural_halls(n: int) -> str:
+    """«1 зал», «2 зала», «10 залов» — иначе гид отвечает «В музее 1 залов»."""
+    if 11 <= n % 100 <= 14:
+        return "залов"
+    return {1: "зал", 2: "зала", 3: "зала", 4: "зала"}.get(n % 10, "залов")
+
+
 def _describe_halls(halls: List[m.Hall]) -> str:
-    """Детерминированный ответ со списком залов (B10)."""
+    """Детерминированный ответ со списком залов (B10).
+
+    `halls` приходит из crud.all_halls_ordered — служебные записи (Парадная
+    лестница) туда уже не попадают.
+
+    Считаем ТОЛЬКО пронумерованные залы: «Вне постоянной экспозиции» — не зал
+    экспозиции, а группа для предметов вне неё, у него по требованию заказчика
+    нет номера (баг-репорт 28.07.2026, п.5). Он есть в списке, но не в счётчике.
+    """
     if not halls:
         return "Пока в каталоге нет залов."
-    main = [h for h in halls if not h.is_temporary]
-    temp = [h for h in halls if h.is_temporary]
+    numbered = [h for h in halls if h.hall_number is not None]
+    unnumbered = [h for h in halls if h.hall_number is None]
+    main = [h for h in numbered if not h.is_temporary]
+    temp = [h for h in numbered if h.is_temporary]
 
     def _fmt(items: List[m.Hall]) -> str:
-        return "; ".join(f"зал {h.hall_number}" + (f" «{h.name}»" if h.name else "") for h in items)
+        return "; ".join(_hall_phrase(h) for h in items)
 
-    lines = [f"В музее {len(halls)} залов."]
+    lines = [f"В музее {len(numbered)} {_plural_halls(len(numbered))}."]
     if main:
         lines.append(f"Основная экспозиция: {_fmt(main)}.")
     if temp:
         lines.append(f"Временные выставки: {_fmt(temp)}.")
+    if unnumbered:
+        lines.append("Кроме того: " + "; ".join(h.name or "без названия" for h in unnumbered) + ".")
     return " ".join(lines)
 
 
@@ -114,18 +150,46 @@ async def generate_story(req: sch.StoryRequest, session: AsyncSession = Depends(
     )
 
 
-@router.post("/chat", response_model=sch.ChatResponse, summary="Диалог с ИИ-гидом")
+def _is_blank_context(context: Optional[sch.GuideContext]) -> bool:
+    """Пустой контекст: `null` или объект, у которого не заполнено ни одно поле (`{}`)."""
+    return context is None or all(v is None for v in context.model_dump().values())
+
+
+@router.post(
+    "/chat", response_model=sch.ChatResponse, summary="Диалог с ИИ-гидом",
+    description=(
+        "Диалог с гидом. Контекст (`context`) управляется явно:\n\n"
+        "* поле `context` **не передано** — бэкенд подставит контекст, сохранённый "
+        "в сессии (продолжение разговора об экспонате/зале);\n"
+        "* `\"context\": {}` или `\"context\": null` — **сброс**: контекст сессии "
+        "очищается, вопрос трактуется как общий (вход в общий чат с главного экрана);\n"
+        "* `\"reset_context\": true` — тот же сброс, но без передачи самого поля;\n"
+        "* заполненный `context` — заменяет контекст сессии целиком.\n\n"
+        "Контекст зала — подсказка, а не рамка: если ответа в нём нет, гид отвечает "
+        "по общим знаниям о музее, а не «в предоставленных материалах нет информации»."
+    ),
+)
 async def chat(req: sch.ChatRequest, session: AsyncSession = Depends(get_session)) -> sch.ChatResponse:
     # Сессия диалога.
     sess: Optional[m.GuideSession] = None
     if req.session_id is not None:
         sess = await session.get(m.GuideSession, req.session_id)
-    context = req.context
+
+    # Раньше `context=None` означало одновременно «не передавали» и «сбросьте», и
+    # бэкенд всегда воскрешал сохранённый контекст. Из-за этого зал «залипал»:
+    # посетитель выходил из Рыцарского зала в общий чат, а гид продолжал отвечать
+    # «в материалах о Рыцарском зале нет…» (баг-репорт 28.07.2026, п.3). Теперь
+    # «не передавали» отличается от «сбросьте» по model_fields_set.
+    context_sent = "context" in req.model_fields_set
+    reset_context = req.reset_context or (context_sent and _is_blank_context(req.context))
+    context = None if reset_context else req.context
     if sess is None:
         sess = m.GuideSession(context=context.model_dump() if context else None)
         session.add(sess)
         await session.flush()
-    elif context is None and sess.context:
+    elif reset_context:
+        sess.context = None
+    elif context is None and not context_sent and sess.context:
         context = sch.GuideContext(**sess.context)
 
     # Контекст-обоснование для модели.
@@ -142,6 +206,9 @@ async def chat(req: sch.ChatRequest, session: AsyncSession = Depends(get_session
             context_exhibit = ex
             exhibit_dict = crud.exhibit_to_dict(ex)
             grounding = " ".join(p for p in (ex.short_description, ex.raw_history) if p)
+            # hall_id берём из ПРИСЛАННОГО контекста, не из прежнего состояния
+            # сессии: при переходе к экспонату другого зала старый зал не должен
+            # оставаться приклеенным (баг-репорт 28.07.2026, п.3).
             context = sch.GuideContext(exhibit_id=ex.id, label_slug=ex.label_slug, hall_id=context.hall_id)
         elif context.hall_id is not None:
             hall = await session.get(m.Hall, context.hall_id)
@@ -220,6 +287,8 @@ async def chat(req: sch.ChatRequest, session: AsyncSession = Depends(get_session
     sess.last_activity = datetime.now(timezone.utc)
     if context is not None:
         sess.context = context.model_dump()
+    elif reset_context:
+        sess.context = None  # сброс переживает и запись сессии, а не только этот ответ
     await session.commit()
 
     return sch.ChatResponse(

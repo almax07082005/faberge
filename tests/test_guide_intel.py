@@ -44,12 +44,35 @@ def test_is_navigational():
 
 def test_is_hall_listing():
     assert gi.is_hall_listing("какие залы есть в музее?")
+    assert gi.is_hall_listing("какие есть залы")
     assert gi.is_hall_listing("сколько залов")
     assert gi.is_hall_listing("перечисли залы")
+    assert gi.is_hall_listing("перечень залов")
+    assert gi.is_hall_listing("список залов")
+    assert gi.is_hall_listing("покажи залы")
+    assert gi.is_hall_listing("все залы")
+    assert gi.is_hall_listing("залы музея")
     assert not gi.is_hall_listing("что в этом зале")
     assert not gi.is_hall_listing("расскажи про яйцо")
     # Вопрос про ОДИН конкретный зал не должен триггерить дамп всех залов.
     assert not gi.is_hall_listing("что за зал 5?")
+
+
+def test_is_hall_listing_with_fillers():
+    """C25: слова-вставки между вопросительным словом и «залы» не должны ломать матч."""
+    assert gi.is_hall_listing("А какие вообще есть залы")
+    assert gi.is_hall_listing("сколько всего залов")
+    assert gi.is_hall_listing("какие тут ещё залы")
+    assert gi.is_hall_listing("сколько у вас залов?")
+    assert gi.is_hall_listing("КАКИЕ ЗАЛЫ ЕСТЬ")  # регистр не важен
+
+
+def test_is_hall_listing_not_hall_contents():
+    """Вопрос про содержимое зала — не запрос перечня залов (иначе ложный дамп)."""
+    assert not gi.is_hall_listing("какие экспонаты в зале 4")
+    assert not gi.is_hall_listing("сколько экспонатов в зале")
+    assert not gi.is_hall_listing("в каких залах есть яйца Фаберже")
+    assert not gi.is_hall_listing("какие экспонаты вообще есть в зале 2")
 
 
 if __name__ == "__main__":

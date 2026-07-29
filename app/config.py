@@ -26,8 +26,21 @@ class Settings(BaseSettings):
     admin_username: str = "admin"                 # логин для POST /admin/login
     admin_password: str = "admin"                 # пароль для POST /admin/login (переопределите в проде!)
     media_dir: str = "media"                      # локальное хранилище (стаб Object Storage)
-    recognition_confidence_threshold: float = 0.6
     max_upload_mb: int = 10
+
+    # ── Распознавание по фото ────────────────────────────────────────────────
+    recognition_confidence_threshold: float = 0.6
+    recognition_timeout_sec: float = 25.0         # таймаут запроса к ML-сервису поиска
+    # Порог нечёткой сшивки названия из ML-индекса с названием в каталоге
+    # (0..1, difflib.SequenceMatcher). Ниже — предсказание отбрасывается и
+    # логируется. 0 отключает нечёткое сопоставление (только точное).
+    recognition_name_match_cutoff: float = 0.86
+
+    # ── Озвучивание ──────────────────────────────────────────────────────────
+    # Прогонять произвольный текст через LLM, чтобы числа звучали порядковыми
+    # («Пётр Первый», а не «Пётр один»). Выключение оставляет детерминированную
+    # нормализацию (app/services/text_normalize.py) — дешевле, но грубее.
+    tts_spoken_via_llm: bool = True
 
     # ── Yandex Cloud (опционально; без ключей сервисы работают в режиме-стабе) ─
     yandex_api_key: Optional[str] = None
