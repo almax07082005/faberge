@@ -46,12 +46,17 @@ class Hall(Base):
     __tablename__ = "halls"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    hall_number: Mapped[int] = mapped_column(Integer, unique=True, nullable=False)
+    # Номер зала на плане. NULL — у зала номера нет: «Вне постоянной экспозиции»
+    # заказчик просил показывать без номера (баг-репорт 28.07.2026, п.5).
+    hall_number: Mapped[Optional[int]] = mapped_column(Integer, unique=True)
     name: Mapped[Optional[str]] = mapped_column(String(255))
     description: Mapped[Optional[str]] = mapped_column(Text)
     level: Mapped[Optional[int]] = mapped_column(Integer)
     cover_image_url: Mapped[Optional[str]] = mapped_column(Text)
     is_temporary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Служебная запись (Парадная лестница, технические залы): хранится в каталоге,
+    # но не показывается посетителю — ни в GET /halls, ни на карте, ни в ответах гида.
+    is_service: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -74,7 +79,10 @@ class Showcase(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     hall_id: Mapped[int] = mapped_column(ForeignKey("halls.id", ondelete="CASCADE"), nullable=False)
-    showcase_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    # NULL — группа «не в витринах» (в путеводителе она отмечена пустым квадратом):
+    # экспонаты зала, стоящие вне витрин. Такая группа в зале одна — гарантируется
+    # частичным уникальным индексом (см. db/schema.sql).
+    showcase_number: Mapped[Optional[int]] = mapped_column(Integer)
     name: Mapped[Optional[str]] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

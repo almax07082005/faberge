@@ -14,14 +14,22 @@ from ..dependencies import Pagination, pagination
 router = APIRouter(tags=["Карта и навигация"])
 
 
+_INCLUDE_SERVICE_DESC = (
+    "Включить служебные залы (`is_service`: Парадная лестница и т.п.). "
+    "По умолчанию `false` — посетителю они не показываются. `true` нужен админке, "
+    "чтобы такие записи оставались управляемыми."
+)
+
+
 @router.get("/map", response_model=sch.MapResponse, summary="Интерактивная карта музея")
 async def get_map(
     is_temporary: Optional[bool] = Query(
         None, description="Фильтр по типу зала: true — временные выставки, false — основная экспозиция."
     ),
+    include_service: bool = Query(False, description=_INCLUDE_SERVICE_DESC),
     session: AsyncSession = Depends(get_session),
 ) -> sch.MapResponse:
-    return await crud.get_map(session, is_temporary)
+    return await crud.get_map(session, is_temporary, include_service)
 
 
 @router.get("/halls", response_model=sch.HallListResponse, summary="Список залов")
@@ -30,9 +38,10 @@ async def list_halls(
     is_temporary: Optional[bool] = Query(
         None, description="Фильтр по типу зала: true — временные выставки, false — основная экспозиция."
     ),
+    include_service: bool = Query(False, description=_INCLUDE_SERVICE_DESC),
     session: AsyncSession = Depends(get_session),
 ) -> sch.HallListResponse:
-    return await crud.list_halls(session, p.limit, p.offset, is_temporary)
+    return await crud.list_halls(session, p.limit, p.offset, is_temporary, include_service)
 
 
 @router.get("/halls/{hall_id}", response_model=sch.HallDetail, summary="Получить зал")

@@ -21,12 +21,15 @@ class HealthStatus(BaseModel):
 class Hall(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
-    hall_number: int
+    # null — у зала нет номера («Вне постоянной экспозиции»): подпись строится
+    # только из названия, без «зал № …».
+    hall_number: Optional[int] = None
     name: Optional[str] = None
     description: Optional[str] = None
     level: Optional[int] = None
     cover_image_url: Optional[str] = None
     is_temporary: bool = False            # зал временной выставки (vs основная экспозиция)
+    is_service: bool = False              # служебная запись: в публичной выдаче не появляется
     sort_order: int = 0                   # порядок вывода в каталоге/админке (drag-n-drop, C11)
     showcase_count: Optional[int] = None
     exhibit_count: Optional[int] = None
@@ -35,7 +38,7 @@ class Hall(BaseModel):
 class HallBrief(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
-    hall_number: int
+    hall_number: Optional[int] = None
     name: Optional[str] = None
 
 
@@ -43,7 +46,9 @@ class Showcase(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
     hall_id: int
-    showcase_number: int
+    # null — группа «не в витринах» (в путеводителе — пустой квадрат): экспонаты
+    # зала, стоящие вне витрин. В зале такая группа одна и выводится последней.
+    showcase_number: Optional[int] = None
     name: Optional[str] = None
     exhibit_count: Optional[int] = None
 
@@ -51,7 +56,7 @@ class Showcase(BaseModel):
 class ShowcaseBrief(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
-    showcase_number: int
+    showcase_number: Optional[int] = None
 
 
 class HallDetail(Hall):
@@ -107,6 +112,10 @@ class ExhibitSummary(BaseModel):
     thumbnail_url: Optional[str] = None
     hall_id: Optional[int] = None
     showcase_id: Optional[int] = None
+    # Номер витрины (null — экспонат вне витрин). Отдаём прямо в списке, чтобы
+    # фронт собирал группировку «витрина → её экспонаты» из одного ответа
+    # GET /halls/{id}/exhibits, без запроса на каждую витрину.
+    showcase_number: Optional[int] = None
     is_temporary: Optional[bool] = None  # унаследовано от зала: экспонат временной выставки
 
 
@@ -214,11 +223,20 @@ class ChatMessage(BaseModel):
 
 class ChatRequest(BaseModel):
     session_id: Optional[uuid.UUID] = None
+    # Контракт контекста (баг-репорт 28.07.2026, п.3):
+    #   • поле не передано вовсе   — бэкенд подставит контекст, сохранённый в сессии;
+    #   • `"context": {}` / `null` — явный СБРОС: контекст сессии очищается,
+    #                                вопрос трактуется как общий;
+    #   • заполненный объект       — заменяет контекст сессии целиком (старый
+    #                                hall_id не «доклеивается»).
     context: Optional[GuideContext] = None
     message: str = Field(min_length=1)
     history: Optional[List[ChatMessage]] = None
     language: str = "ru"
     max_questions: int = Field(default=3, ge=0, le=6)
+    # Явный сброс контекста без передачи самого поля `context` — для входа в общий
+    # чат с главного экрана, когда клиент переиспользует прежний `session_id`.
+    reset_context: bool = False
 
 
 # Плашка экспоната в ответе гида (B6): фронт рисует компонент exhibit-plaque.
@@ -236,7 +254,7 @@ class ReferencedExhibit(BaseModel):
 class ReferencedHall(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
-    hall_number: int
+    hall_number: Optional[int] = None
     name: Optional[str] = None
 
 
@@ -296,27 +314,33 @@ class SpeechResponse(BaseModel):
 
 # ── Администрирование ────────────────────────────────────────────────────────
 class HallCreate(BaseModel):
-    hall_number: int
+    # null — зал без номера («Вне постоянной экспозиции»).
+    hall_number: Optional[int] = None
     name: Optional[str] = None
     description: Optional[str] = None
     level: Optional[int] = None
     is_temporary: bool = False
-    sort_order: Optional[int] = None      # если не указан — бэкенд ставит hall_number
+    is_service: bool = False              # служебная запись: скрыта из публичной выдачи
+    # Если не указан — бэкенд ставит hall_number, а залу без номера даёт конец списка.
+    sort_order: Optional[int] = None
 
 
 class HallPatch(BaseModel):
+    # hall_number допускает явный null — так зал становится «без номера»
+    # (заказчик: «ЗАЛ № 99 — Вне постоянной экспозиции» показывать без номера).
     hall_number: Optional[int] = None
     name: Optional[str] = None
     description: Optional[str] = None
     level: Optional[int] = None
     cover_image_url: Optional[str] = None
     is_temporary: Optional[bool] = None
+    is_service: Optional[bool] = None
     sort_order: Optional[int] = None
 
     @model_validator(mode="after")
     def _reject_null_required(self) -> "HallPatch":
         # Не-nullable в БД поля нельзя обнулять явным null (иначе IntegrityError → 409).
-        for field in ("hall_number", "is_temporary", "sort_order"):
+        for field in ("is_temporary", "is_service", "sort_order"):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"Поле '{field}' не может быть null.")
         return self
@@ -343,7 +367,9 @@ class LoginResponse(BaseModel):
 
 class ShowcaseCreate(BaseModel):
     hall_id: int
-    showcase_number: int
+    # null — группа «не в витринах» (в путеводителе — пустой квадрат). В зале
+    # допустима одна такая группа: повтор → 409.
+    showcase_number: Optional[int] = None
     name: Optional[str] = None
 
 
@@ -356,12 +382,11 @@ class ShowcasePatch(BaseModel):
 
     @model_validator(mode="after")
     def _reject_null_required(self) -> "ShowcasePatch":
-        # hall_id и showcase_number — NOT NULL в БД: явный null это ошибка ввода (422),
-        # а не «поле не передано». Иначе IntegrityError маппился бы в неверный 409.
-        # name допускает null (в БД nullable).
-        for field in ("hall_id", "showcase_number"):
-            if field in self.model_fields_set and getattr(self, field) is None:
-                raise ValueError(f"Поле '{field}' не может быть null.")
+        # hall_id — NOT NULL в БД: явный null это ошибка ввода (422), а не «поле не
+        # передано». Иначе IntegrityError маппился бы в неверный 409.
+        # name и showcase_number допускают null (в БД nullable).
+        if "hall_id" in self.model_fields_set and self.hall_id is None:
+            raise ValueError("Поле 'hall_id' не может быть null.")
         return self
 
 

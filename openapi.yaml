@@ -199,6 +199,7 @@ paths:
       security: []
       parameters:
         - $ref: '#/components/parameters/IsTemporary'
+        - $ref: '#/components/parameters/IncludeService'
       responses:
         '200':
           description: Дерево залов и витрин.
@@ -211,13 +212,17 @@ paths:
     get:
       tags: [Карта и навигация]
       summary: Список залов
-      description: Постраничный список залов музея для карты и навигации.
+      description: >-
+        Постраничный список залов музея для карты и навигации. Служебные записи
+        (`is_service`) в выдачу не попадают — источник правды один, скрывать их
+        на клиенте не нужно.
       operationId: listHalls
       security: []
       parameters:
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Offset'
         - $ref: '#/components/parameters/IsTemporary'
+        - $ref: '#/components/parameters/IncludeService'
       responses:
         '200':
           description: Список залов.
@@ -1631,6 +1636,18 @@ components:
       schema:
         type: boolean
       example: true
+    IncludeService:
+      name: include_service
+      in: query
+      required: false
+      description: >-
+        Включить служебные залы (`is_service`: Парадная лестница и т.п.). По
+        умолчанию `false` — посетителю такие записи не показываются. `true`
+        нужен админке, чтобы служебный зал оставался управляемым.
+      schema:
+        type: boolean
+        default: false
+      example: false
     HallId:
       name: hall_id
       in: path
@@ -1766,14 +1783,18 @@ components:
     # ── Залы ──
     Hall:
       type: object
-      required: [id, hall_number]
+      required: [id]
       properties:
         id:
           type: integer
           example: 5
         hall_number:
           type: integer
-          description: Номер зала на плане экспозиции (уникальный).
+          nullable: true
+          description: >-
+            Номер зала на плане экспозиции (уникальный). `null` — у зала номера
+            нет («Вне постоянной экспозиции»): подпись строится только из
+            названия, без «зал № …». Такие залы выводятся последними.
           example: 5
         name:
           type: string
@@ -1806,6 +1827,14 @@ components:
             `false` — основная (постоянная) экспозиция. Основа для тега/фильтра
             «Временная выставка» в каталоге и переключателя в админке.
           example: false
+        is_service:
+          type: boolean
+          default: false
+          description: >-
+            Служебная запись каталога (Парадная лестница и т.п.). Такие залы не
+            попадают ни в `GET /halls`, ни на карту, ни в ответы гида — увидеть
+            их можно только с `?include_service=true` (нужно админке).
+          example: false
         sort_order:
           type: integer
           default: 0
@@ -1823,13 +1852,15 @@ components:
     HallBrief:
       type: object
       description: Краткая ссылка на зал (для вложений в карточку экспоната).
-      required: [id, hall_number]
+      required: [id]
       properties:
         id:
           type: integer
           example: 5
         hall_number:
           type: integer
+          nullable: true
+          description: '`null` — зал без номера («Вне постоянной экспозиции»).'
           example: 5
         name:
           type: string
@@ -1887,7 +1918,7 @@ components:
     # ── Витрины ──
     Showcase:
       type: object
-      required: [id, hall_id, showcase_number]
+      required: [id, hall_id]
       properties:
         id:
           type: integer
@@ -1897,7 +1928,12 @@ components:
           example: 5
         showcase_number:
           type: integer
-          description: Номер витрины внутри зала (уникален в пределах зала).
+          nullable: true
+          description: >-
+            Номер витрины внутри зала (уникален в пределах зала). `null` —
+            группа «не в витринах»: в путеводителе она отмечена пустым
+            квадратом, это экспонаты зала вне витрин. Такая группа в зале одна
+            (попытка завести вторую → `409`) и выводится последней.
           example: 3
         name:
           type: string
@@ -1910,13 +1946,15 @@ components:
 
     ShowcaseBrief:
       type: object
-      required: [id, showcase_number]
+      required: [id]
       properties:
         id:
           type: integer
           example: 12
         showcase_number:
           type: integer
+          nullable: true
+          description: '`null` — экспонат стоит вне витрин.'
           example: 3
 
     ShowcaseDetail:
@@ -2023,6 +2061,14 @@ components:
           type: integer
           nullable: true
           example: 12
+        showcase_number:
+          type: integer
+          nullable: true
+          description: >-
+            Номер витрины экспоната (`null` — вне витрин). Отдаётся прямо в
+            списке, чтобы группировку «витрина → её экспонаты» можно было
+            собрать из одного ответа `GET /halls/{hall_id}/exhibits`.
+          example: 3
         is_temporary:
           type: boolean
           nullable: true
@@ -2345,7 +2391,24 @@ components:
           description: Идентификатор диалога. Если не задан — сервер создаст новый.
           example: 2f6a9b3c-1d4e-4f8a-9c2b-5e7a1d0c3b66
         context:
-          $ref: '#/components/schemas/GuideContext'
+          allOf:
+            - $ref: '#/components/schemas/GuideContext'
+          nullable: true
+          description: >-
+            Экспонат/зал, рядом с которым находится посетитель. Поведение
+            зависит от того, передано ли поле:
+            поле **не передано** — сервер подставит контекст, сохранённый в
+            сессии (продолжение разговора);
+            `{}` или `null` — **сброс**: контекст сессии очищается, вопрос
+            трактуется как общий (вход в общий чат с главного экрана);
+            заполненный объект — заменяет контекст сессии целиком.
+        reset_context:
+          type: boolean
+          default: false
+          description: >-
+            Явный сброс контекста без передачи самого `context` — для входа в
+            общий чат, когда клиент переиспользует прежний `session_id`.
+          example: false
         message:
           type: string
           minLength: 1
@@ -2433,13 +2496,15 @@ components:
     ReferencedHall:
       type: object
       description: Структурированный зал в ответе гида (B10).
-      required: [id, hall_number]
+      required: [id]
       properties:
         id:
           type: integer
           example: 3
         hall_number:
           type: integer
+          nullable: true
+          description: '`null` — зал без номера («Вне постоянной экспозиции»).'
           example: 3
         name:
           type: string
@@ -2534,10 +2599,13 @@ components:
     # ── Администрирование ──
     HallCreate:
       type: object
-      required: [hall_number]
       properties:
         hall_number:
           type: integer
+          nullable: true
+          description: >-
+            Номер зала. `null` — зал без номера («Вне постоянной экспозиции»):
+            в подписях выводится только название.
           example: 5
         name:
           type: string
@@ -2555,12 +2623,19 @@ components:
           default: false
           description: Отметить зал как временную выставку (переключатель в админке).
           example: false
+        is_service:
+          type: boolean
+          default: false
+          description: >-
+            Служебная запись: зал остаётся в каталоге, но исчезает из публичной
+            выдачи (`GET /halls`, карта, ответы гида).
+          example: false
         sort_order:
           type: integer
           nullable: true
           description: >-
             Порядок вывода в каталоге/админке (drag-n-drop). Если не указан,
-            ставится hall_number.
+            ставится hall_number (а для зала без номера — конец списка).
           example: 5
 
     HallPatch:
@@ -2570,6 +2645,9 @@ components:
         hall_number:
           type: integer
           nullable: true
+          description: >-
+            Явный `null` убирает номер зала (зал остаётся в каталоге и
+            показывается по названию).
           example: 5
         name:
           type: string
@@ -2591,6 +2669,13 @@ components:
           type: boolean
           nullable: true
           description: Переключатель «Временная выставка» для зала.
+          example: true
+        is_service:
+          type: boolean
+          nullable: true
+          description: >-
+            Переключатель «служебная запись»: скрывает зал из публичной выдачи,
+            не удаляя его и не трогая привязанные экспонаты.
           example: true
         sort_order:
           type: integer
@@ -2639,13 +2724,18 @@ components:
 
     ShowcaseCreate:
       type: object
-      required: [hall_id, showcase_number]
+      required: [hall_id]
       properties:
         hall_id:
           type: integer
           example: 5
         showcase_number:
           type: integer
+          nullable: true
+          description: >-
+            Номер витрины по путеводителю. `null` — группа «не в витринах»
+            (пустой квадрат в путеводителе); в зале она одна, попытка завести
+            вторую → `409`.
           example: 3
         name:
           type: string
@@ -2663,6 +2753,10 @@ components:
           example: 5
         showcase_number:
           type: integer
+          nullable: true
+          description: >-
+            Номер витрины. Явный `null` превращает витрину в группу
+            «не в витринах» (в зале допустима одна такая, иначе `409`).
           example: 3
         name:
           type: string

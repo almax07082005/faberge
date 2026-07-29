@@ -9,14 +9,15 @@ from __future__ import annotations
 import hashlib
 import os
 import wave
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Optional
 
 import httpx
 
 from ..config import settings
-from . import UpstreamError, storage
-from .text_normalize import normalize_for_tts
+from . import UpstreamError, llm, storage
+from .text_normalize import has_numerals, normalize_for_tts
 
 SPEECHKIT_URL = "https://tts.api.cloud.yandex.net/speech/v1/tts:synthesize"
 _CHARS_PER_SEC = 14.0  # грубая оценка темпа речи
@@ -60,6 +61,46 @@ def _cache_key(voice: str, text: str, role: str, speed: float, fmt: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
+# ── Числительные прописью перед синтезом ─────────────────────────────────────
+# Баг-репорт 28.07.2026, п.2: «Пётр I» уходил в синтез как «Пётр 1» и звучал
+# «Пётр один». Правильную форму («Пётр Первый», «в девятнадцатом веке») даёт
+# llm.to_spoken_text — тот же инструмент, что готовит short_description_spoken
+# у экспонатов (E15). Здесь он подключён и к произвольному тексту (кнопка
+# «Прослушать» в чате), а детерминированный normalize_for_tts остаётся фолбэком.
+#
+# Стоимость: LLM зовём только когда в тексте реально есть числа, и кэшируем
+# результат по хэшу исходного текста — повторные «Прослушать» на том же ответе
+# гида и типовые фразы не оплачиваются заново. Кэш процессный (LRU): при
+# рестарте/масштабировании просто прогревается заново.
+_SPOKEN_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_SPOKEN_CACHE_MAX = 512
+# Защита от «разговорчивой» модели: если LLM вернул явно не переписанный текст
+# (пусто или втрое длиннее исходного), берём детерминированный вариант.
+_SPOKEN_MAX_GROWTH = 3.0
+
+
+async def prepare_for_tts(text: str) -> str:
+    """Подготовить произвольный текст к синтезу: числа — прописью, в нужном падеже."""
+    if not text or not has_numerals(text):
+        return text
+    key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    cached = _SPOKEN_CACHE.get(key)
+    if cached is not None:
+        _SPOKEN_CACHE.move_to_end(key)
+        return cached
+    spoken = None
+    if settings.tts_spoken_via_llm:
+        # to_spoken_text сам возвращает None, если LLM не настроен или недоступен.
+        spoken = await llm.to_spoken_text(text)
+        if spoken and len(spoken) > len(text) * _SPOKEN_MAX_GROWTH:
+            spoken = None
+    result = spoken or normalize_for_tts(text)
+    _SPOKEN_CACHE[key] = result
+    if len(_SPOKEN_CACHE) > _SPOKEN_CACHE_MAX:
+        _SPOKEN_CACHE.popitem(last=False)
+    return result
+
+
 @dataclass
 class SpeechOutcome:
     audio_url: str
@@ -76,10 +117,10 @@ async def synthesize(
     speed: float = 1.0,
     emotion: str = "good",
 ) -> SpeechOutcome:
-    # Чиним римские цифры («XIX век», «Александр III»), чтобы TTS не читал их
-    # по буквам. Делаем до подсчёта символов и кэш-ключа — на синтез уходит
-    # ровно тот текст, что и кэшируется.
-    text = normalize_for_tts(text)
+    # Числа — прописью в нужном падеже («Пётр I» → «Пётр Первый», «XIX век» →
+    # «девятнадцатый век»). Делаем ДО подсчёта символов и кэш-ключа — иначе на
+    # старые записи кэша отдавалась бы прежняя (неправильная) озвучка.
+    text = await prepare_for_tts(text)
     characters = len(text)
     if settings.tts_configured:
         return await _synthesize_yandex(text, voice, fmt, speed, emotion, characters)
