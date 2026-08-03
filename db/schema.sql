@@ -149,23 +149,79 @@ CREATE TABLE IF NOT EXISTS guide_sessions (
 );
 
 CREATE TABLE IF NOT EXISTS guide_messages (
-    id         BIGSERIAL PRIMARY KEY,
-    session_id UUID NOT NULL REFERENCES guide_sessions(id) ON DELETE CASCADE,
-    role       VARCHAR(16) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
-    content    TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    id          BIGSERIAL PRIMARY KEY,
+    session_id  UUID NOT NULL REFERENCES guide_sessions(id) ON DELETE CASCADE,
+    role        VARCHAR(16) NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content     TEXT NOT NULL,
+    -- Смог ли гид ответить (§4 ТЗ 03.08.2026). Проставляется в момент генерации
+    -- ответа, не постфактум. NULL — признак не проставлен (сообщения до миграции
+    -- 2026-08-03; разовый бэкфилл — scripts/backfill_unanswered.py).
+    -- Пишется на ОБЕ строки пары (вопрос и ответ), чтобы отчёт «вопросы без
+    -- ответа» читал role='user' без self-join.
+    answered    BOOLEAN,
+    fail_reason VARCHAR(32) CHECK (fail_reason IS NULL OR fail_reason IN
+                     ('no_context', 'llm_refusal', 'not_found', 'error')),
+    -- Контекст вопроса: у какого экспоната/зала посетитель спрашивал.
+    exhibit_id  INT,
+    hall_id     INT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Телеметрия (источник для административной аналитики) ------------------------
+-- Персональных данных не содержит: session_id и device_id — случайные UUID,
+-- генерируются на клиенте; props принимается по белому списку ключей
+-- (app/schemas.py: EVENT_PROPS_ALLOWED). См. docs/analytics-privacy.md.
 CREATE TABLE IF NOT EXISTS events (
-    id         BIGSERIAL PRIMARY KEY,
-    session_id UUID,
-    type       VARCHAR(32) NOT NULL,
-    exhibit_id INT,
-    hall_id    INT,
-    label_slug VARCHAR(100),
-    props      JSONB,
-    ts         TIMESTAMPTZ NOT NULL DEFAULT now()
+    id          BIGSERIAL PRIMARY KEY,
+    session_id  UUID,
+    type        VARCHAR(32) NOT NULL,
+    exhibit_id  INT,
+    hall_id     INT,
+    showcase_id INT,
+    label_slug  VARCHAR(100),
+    -- Анонимный постоянный идентификатор устройства (localStorage) — только для
+    -- метрики повторных визитов (§7). Ни с чем персональным не связывается.
+    device_id   UUID,
+    props       JSONB,
+    ts          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Идемпотентная миграция для существующих БД (см. пояснение у halls выше).
+ALTER TABLE guide_messages ADD COLUMN IF NOT EXISTS answered    BOOLEAN;
+ALTER TABLE guide_messages ADD COLUMN IF NOT EXISTS fail_reason VARCHAR(32);
+ALTER TABLE guide_messages ADD COLUMN IF NOT EXISTS exhibit_id  INT;
+ALTER TABLE guide_messages ADD COLUMN IF NOT EXISTS hall_id     INT;
+ALTER TABLE guide_messages DROP CONSTRAINT IF EXISTS guide_messages_fail_reason_chk;
+ALTER TABLE guide_messages ADD CONSTRAINT guide_messages_fail_reason_chk
+    CHECK (fail_reason IS NULL OR fail_reason IN ('no_context', 'llm_refusal', 'not_found', 'error'));
+ALTER TABLE events ADD COLUMN IF NOT EXISTS showcase_id INT;
+ALTER TABLE events ADD COLUMN IF NOT EXISTS device_id   UUID;
+
+-- Ночной пересчёт агрегатов (§12) ---------------------------------------------
+-- Плоский суточный срез: метрика × измерение × день. Джоб идемпотентен —
+-- пересчёт за дату перезаписывает строки по первичному ключу.
+-- dimension_key = '' означает метрику без разреза (NULL в PK недопустим).
+CREATE TABLE IF NOT EXISTS analytics_daily (
+    date          DATE             NOT NULL,
+    metric        VARCHAR(64)      NOT NULL,
+    dimension_key VARCHAR(128)     NOT NULL DEFAULT '',
+    dimension_id  INT,
+    value         DOUBLE PRECISION NOT NULL DEFAULT 0,
+    updated_at    TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    PRIMARY KEY (date, metric, dimension_key)
+);
+
+-- Кэш готовых отчётов за период. Отчёты с кластеризацией вопросов и разбором
+-- последовательностей событий в плоскую суточную схему не ложатся.
+-- period_key = '<from>:<to>' с пустыми частями для открытых границ.
+CREATE TABLE IF NOT EXISTS analytics_reports (
+    report      VARCHAR(32) NOT NULL,
+    period_key  VARCHAR(64) NOT NULL,
+    period_from DATE,
+    period_to   DATE,
+    payload     JSONB       NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (report, period_key)
 );
 
 -- Индексы --------------------------------------------------------------------
@@ -175,6 +231,17 @@ CREATE INDEX IF NOT EXISTS idx_exhibit_images_exh   ON exhibit_images(exhibit_id
 CREATE INDEX IF NOT EXISTS idx_guide_messages_sess  ON guide_messages(session_id);
 CREATE INDEX IF NOT EXISTS idx_events_type_ts       ON events(type, ts);
 CREATE INDEX IF NOT EXISTS idx_events_session_ts    ON events(session_id, ts);  -- аналитика по сессиям (C17/C18)
+-- Аналитика 03.08.2026 (§2): events не чистится и растёт линейно от посещаемости,
+-- без этих индексов все отчёты читают таблицу полным сканом.
+CREATE INDEX IF NOT EXISTS idx_events_ts            ON events(ts);
+CREATE INDEX IF NOT EXISTS idx_events_device        ON events(device_id)   WHERE device_id   IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_events_exhibit_type  ON events(exhibit_id, type) WHERE exhibit_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_events_hall_type     ON events(hall_id, type)    WHERE hall_id    IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_events_showcase      ON events(showcase_id) WHERE showcase_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_guide_messages_unanswered
+    ON guide_messages(created_at) WHERE answered IS FALSE AND role = 'user';
+CREATE INDEX IF NOT EXISTS idx_analytics_daily_metric   ON analytics_daily(metric, date);
+CREATE INDEX IF NOT EXISTS idx_analytics_reports_updated ON analytics_reports(updated_at);
 CREATE INDEX IF NOT EXISTS idx_halls_name_trgm      ON halls    USING gin (name gin_trgm_ops);
 CREATE INDEX IF NOT EXISTS idx_halls_is_temporary    ON halls(is_temporary);
 CREATE INDEX IF NOT EXISTS idx_halls_is_service      ON halls(is_service);

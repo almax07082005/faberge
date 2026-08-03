@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import statistics
-from collections import Counter, defaultdict
-from datetime import date
+from collections import Counter
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import (
@@ -18,11 +18,14 @@ from sqlalchemy import (
     text,
     update as sa_update,
 )
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from . import models as m
 from . import schemas as sch
+from .config import settings
+from .services import question_cluster, visits
 
 
 # ── Сериализаторы ────────────────────────────────────────────────────────────
@@ -779,30 +782,132 @@ async def add_exhibit_image(session: AsyncSession, exhibit_id: int, url: str, is
     return img
 
 
-# ── Телеметрия / аналитика ───────────────────────────────────────────────────
-async def insert_events(session: AsyncSession, batch: sch.EventBatch) -> int:
-    objs = [
-        m.Event(
-            session_id=batch.session_id, type=e.type, exhibit_id=e.exhibit_id, hall_id=e.hall_id,
-            label_slug=e.label_slug, props=e.props, ts=e.ts,
+# ── Телеметрия ───────────────────────────────────────────────────────────────
+async def insert_events(session: AsyncSession, batch: sch.EventBatch) -> Tuple[int, int]:
+    """Записать батч событий. Возвращает (принято, отброшено).
+
+    Событие с типом вне словаря (§1) отбрасывается поштучно: фронт шлёт пачкой,
+    и одна опечатка не должна стоить девяти корректных событий. `props`
+    фильтруется по белому списку контракта (§10), `audio_play` нормализуется в
+    канонический `tts_play`.
+    """
+    objs: List[m.Event] = []
+    rejected = 0
+    for raw in batch.events:
+        ev = sch.normalize_event(raw)
+        if ev is None:
+            rejected += 1
+            continue
+        fields = dict(
+            session_id=batch.session_id,
+            type=ev.type,
+            exhibit_id=ev.exhibit_id,
+            hall_id=ev.hall_id,
+            showcase_id=ev.showcase_id,
+            label_slug=ev.label_slug,
+            device_id=ev.device_id or batch.device_id,
+            props=ev.props,
         )
-        for e in batch.events
-    ]
-    session.add_all(objs)
-    await session.commit()
-    return len(objs)
+        # ts проставляет фронт в момент действия; если не прислали — ставит БД
+        # (server_default). Явный None записал бы NULL в NOT NULL-колонку.
+        if ev.ts is not None:
+            fields["ts"] = ev.ts
+        objs.append(m.Event(**fields))
+    if objs:
+        session.add_all(objs)
+        await session.commit()
+    return len(objs), rejected
 
 
-async def analytics_overview(session: AsyncSession, dfrom: Optional[date], dto: Optional[date]) -> sch.AnalyticsOverview:
-    def _range(col):
-        conds = []
-        if dfrom is not None:
-            conds.append(col >= dfrom)
-        if dto is not None:
-            conds.append(col < dto)
-        return and_(*conds) if conds else None
+# ── Аналитика: общее ─────────────────────────────────────────────────────────
+# Граница `to` ВКЛЮЧАЮЩАЯ: «с 1 по 31 июля» в интерфейсе означает, что события
+# 31 июля попадают в выборку. Раньше фильтр был `col < to`, и последний день
+# периода молча терялся (§2).
+def _range_conds(col, dfrom: Optional[date], dto: Optional[date]) -> List:
+    conds = []
+    if dfrom is not None:
+        conds.append(col >= dfrom)
+    if dto is not None:
+        conds.append(col < dto + timedelta(days=1))
+    return conds
 
-    ev_range = _range(m.Event.ts)
+
+def _range_filter(col, dfrom: Optional[date], dto: Optional[date]):
+    conds = _range_conds(col, dfrom, dto)
+    return and_(*conds) if conds else None
+
+
+def _iso(value: Optional[date]) -> Optional[str]:
+    return value.isoformat() if value else None
+
+
+def _rate(part: int, whole: int) -> float:
+    return round(part / whole, 4) if whole else 0.0
+
+
+# Тип события «прослушать»: канонический `tts_play` плюс исторический `audio_play`,
+# который фронт слал до 03.08.2026 (нормализуется на приёме, но в накопленных
+# данных остаётся как есть).
+_TTS_TYPES = ("tts_play", "audio_play")
+
+
+def _prop_bool(props: Optional[dict], key: str) -> bool:
+    """Значение `props[key]` как bool: фронт может прислать и true, и \"true\"."""
+    if not props:
+        return False
+    value = props.get(key)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() == "true"
+
+
+def _prop_float(props: Optional[dict], key: str) -> Optional[float]:
+    if not props:
+        return None
+    try:
+        return float(props[key])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+async def _top_items(
+    session: AsyncSession, id_col, ev_type: str, entity, ev_range, limit: int = 5
+) -> List[sch.AnalyticsTopItem]:
+    """Топ сущностей по событиям типа `ev_type` (имя берётся джойном, не запросом на строку)."""
+    stmt = (
+        select(id_col, entity.name, func.count().label("c"))
+        .select_from(m.Event)
+        .join(entity, entity.id == id_col)
+        .where(m.Event.type == ev_type, id_col.isnot(None))
+    )
+    if ev_range is not None:
+        stmt = stmt.where(ev_range)
+    stmt = stmt.group_by(id_col, entity.name).order_by(func.count().desc(), id_col).limit(limit)
+    rows = (await session.execute(stmt)).all()
+    return [sch.AnalyticsTopItem(id=ent_id, name=name, count=count) for ent_id, name, count in rows]
+
+
+async def _hall_names(session: AsyncSession, hall_ids: Set[int]) -> Dict[int, Optional[str]]:
+    if not hall_ids:
+        return {}
+    rows = await session.execute(select(m.Hall.id, m.Hall.name).where(m.Hall.id.in_(list(hall_ids))))
+    return {hid: name for hid, name in rows.all()}
+
+
+async def _exhibit_names(session: AsyncSession, exhibit_ids: Set[int]) -> Dict[int, Optional[str]]:
+    if not exhibit_ids:
+        return {}
+    rows = await session.execute(
+        select(m.Exhibit.id, m.Exhibit.name).where(m.Exhibit.id.in_(list(exhibit_ids)))
+    )
+    return {eid: name for eid, name in rows.all()}
+
+
+# ── Аналитика: сводка ────────────────────────────────────────────────────────
+async def analytics_overview(
+    session: AsyncSession, dfrom: Optional[date], dto: Optional[date], limit: int = 5
+) -> sch.AnalyticsOverview:
+    ev_range = _range_filter(m.Event.ts, dfrom, dto)
 
     async def _count(flt):
         stmt = select(func.count()).select_from(m.Event)
@@ -819,27 +924,26 @@ async def analytics_overview(session: AsyncSession, dfrom: Optional[date], dto: 
 
     total_app_opens = await _count(m.Event.type == "app_open")
     total_recognitions = await _count(m.Event.type == "recognition")
-    success = await _count(and_(m.Event.type == "recognition", cast(m.Event.props["recognized"].astext, String) == "true"))
-    total_audio_plays = await _count(m.Event.type == "audio_play")
+    success = await _count(
+        and_(m.Event.type == "recognition", cast(m.Event.props["recognized"].astext, String) == "true")
+    )
+    total_audio_plays = await _count(m.Event.type.in_(_TTS_TYPES))
 
     msg_stmt = select(func.count()).select_from(m.GuideMessage).where(m.GuideMessage.role == "user")
-    if dfrom is not None:
-        msg_stmt = msg_stmt.where(m.GuideMessage.created_at >= dfrom)
-    if dto is not None:
-        msg_stmt = msg_stmt.where(m.GuideMessage.created_at < dto)
+    for cond in _range_conds(m.GuideMessage.created_at, dfrom, dto):
+        msg_stmt = msg_stmt.where(cond)
     total_chat_messages = (await session.execute(msg_stmt)).scalar_one()
 
-    top_exhibits = await _top_items(session, m.Event.exhibit_id, "exhibit_view", m.Exhibit, ev_range)
-    top_halls = await _top_items(session, m.Event.hall_id, "hall_view", m.Hall, ev_range)
+    top_exhibits = await _top_items(session, m.Event.exhibit_id, "exhibit_view", m.Exhibit, ev_range, limit)
+    top_halls = await _top_items(session, m.Event.hall_id, "hall_view", m.Hall, ev_range, limit)
 
-    rate = round(success / total_recognitions, 4) if total_recognitions else 0.0
     return sch.AnalyticsOverview(
-        from_=dfrom.isoformat() if dfrom else None,
-        to=dto.isoformat() if dto else None,
+        from_=_iso(dfrom),
+        to=_iso(dto),
         total_sessions=total_sessions,
         total_app_opens=total_app_opens,
         total_recognitions=total_recognitions,
-        recognition_success_rate=rate,
+        recognition_success_rate=_rate(success, total_recognitions),
         total_chat_messages=total_chat_messages,
         total_audio_plays=total_audio_plays,
         top_exhibits=top_exhibits,
@@ -847,176 +951,354 @@ async def analytics_overview(session: AsyncSession, dfrom: Optional[date], dto: 
     )
 
 
-async def _top_items(session: AsyncSession, id_col, ev_type: str, entity, ev_range) -> List[sch.AnalyticsTopItem]:
-    stmt = select(id_col, func.count().label("c")).select_from(m.Event).where(m.Event.type == ev_type, id_col.isnot(None))
-    if ev_range is not None:
-        stmt = stmt.where(ev_range)
-    stmt = stmt.group_by(id_col).order_by(func.count().desc()).limit(5)
-    rows = (await session.execute(stmt)).all()
-    items: List[sch.AnalyticsTopItem] = []
-    for ent_id, count in rows:
-        name = (await session.execute(select(entity.name).where(entity.id == ent_id))).scalar_one_or_none()
-        items.append(sch.AnalyticsTopItem(id=ent_id, name=name, count=count))
-    return items
+# ── Аналитика: частые/редкие вопросы (C16 + §3) ──────────────────────────────
+# Сколько различных формулировок тянуть в кластеризатор. Кластеризация — O(n·k)
+# по формулировкам, поэтому берём самые частые. Если формулировок больше, срез
+# виден по `unique_questions` (полное число) против `total_clusters`.
+_QUESTION_FETCH_LIMIT = 5000
 
 
-async def _hall_names(session: AsyncSession, hall_ids: Set[int]) -> Dict[int, Optional[str]]:
-    if not hall_ids:
-        return {}
-    rows = await session.execute(select(m.Hall.id, m.Hall.name).where(m.Hall.id.in_(list(hall_ids))))
-    return {hid: name for hid, name in rows.all()}
-
-
-# ── C16: частые/редкие вопросы (агрегат по guide_messages) ────────────────────
 async def analytics_questions(
     session: AsyncSession, dfrom: Optional[date], dto: Optional[date], limit: int = 20
 ) -> sch.AnalyticsQuestions:
-    """Топ частых и редких вопросов посетителей.
+    """Топ частых и редких вопросов посетителей, сгруппированных ПО СМЫСЛУ.
 
-    Источник — реальные реплики пользователя (``guide_messages.role='user'``).
-    Формулировки нормализуем (trim + lower) и группируем, чтобы «Кто это?» и
-    «кто это? » считались одним вопросом.
+    Источник — реплики пользователя (`guide_messages.role='user'`). Группировка
+    по точному тексту (как было до §3) на живых данных вырождается: «Сколько
+    стоит яйцо?» и «какая цена яйца» — два вопроса с count=1. Смысловые группы
+    строит app/services/question_cluster.py.
     """
-    norm = func.lower(func.trim(m.GuideMessage.content))
-    conds = [m.GuideMessage.role == "user", func.length(func.trim(m.GuideMessage.content)) > 0]
-    if dfrom is not None:
-        conds.append(m.GuideMessage.created_at >= dfrom)
-    if dto is not None:
-        conds.append(m.GuideMessage.created_at < dto)
+    trimmed = func.trim(m.GuideMessage.content)
+    conds = [m.GuideMessage.role == "user", func.length(trimmed) > 0]
+    conds += _range_conds(m.GuideMessage.created_at, dfrom, dto)
     where = and_(*conds)
 
-    grouped = select(norm.label("q"), func.count().label("c")).where(where).group_by(norm)
-    freq_rows = (await session.execute(grouped.order_by(func.count().desc(), norm).limit(limit))).all()
-    rare_rows = (await session.execute(grouped.order_by(func.count().asc(), norm).limit(limit))).all()
+    grouped = select(trimmed.label("q"), func.count().label("c")).where(where).group_by(trimmed)
+    rows = (
+        await session.execute(grouped.order_by(func.count().desc(), trimmed).limit(_QUESTION_FETCH_LIMIT))
+    ).all()
 
     total = (await session.execute(select(func.count()).select_from(m.GuideMessage).where(where))).scalar_one()
     unique = (await session.execute(select(func.count()).select_from(grouped.subquery()))).scalar_one()
 
+    clusters = question_cluster.cluster_questions([(q, c) for q, c in rows])
+    frequent = clusters[:limit]
+    frequent_ids = {id(c) for c in frequent}
+    # «Редкие» — кластеры, встретившиеся не чаще порога, и НЕ попавшие в частые.
+    # Раньше rare был тем же запросом с ORDER BY ... ASC и при малом объёме
+    # данных дублировал frequent слово в слово.
+    rare = [c for c in clusters if c.count <= settings.analytics_rare_max_count and id(c) not in frequent_ids]
+    rare.sort(key=lambda c: (c.count, c.question))
+
+    def _item(cluster: question_cluster.QuestionCluster) -> sch.AnalyticsQuestionItem:
+        return sch.AnalyticsQuestionItem(
+            question=cluster.question, count=cluster.count, variants=cluster.variants
+        )
+
     return sch.AnalyticsQuestions(
-        from_=dfrom.isoformat() if dfrom else None,
-        to=dto.isoformat() if dto else None,
+        from_=_iso(dfrom),
+        to=_iso(dto),
         total_questions=total,
         unique_questions=unique,
-        frequent=[sch.AnalyticsQuestionItem(question=q, count=c) for q, c in freq_rows],
-        rare=[sch.AnalyticsQuestionItem(question=q, count=c) for q, c in rare_rows],
+        total_clusters=len(clusters),
+        frequent=[_item(c) for c in frequent],
+        rare=[_item(c) for c in rare[:limit]],
     )
 
 
-# ── C17: длительность сессии (первое открытие → последнее взаимодействие) ─────
+# ── Аналитика: вопросы без ответа гида (§4) ──────────────────────────────────
+async def analytics_unanswered(
+    session: AsyncSession, dfrom: Optional[date], dto: Optional[date], limit: int = 20
+) -> sch.AnalyticsUnanswered:
+    """Вопросы, на которые гид не смог ответить — подсказка, чего не хватает в описаниях.
+
+    Признак `answered` проставляется в момент генерации ответа (app/routers/guide.py);
+    у сообщений, накопленных до миграции 2026-08-03, он NULL — такие в расчёт
+    доли не входят и считаются отдельно (`unclassified`).
+    """
+    trimmed = func.trim(m.GuideMessage.content)
+    base = [m.GuideMessage.role == "user"] + _range_conds(m.GuideMessage.created_at, dfrom, dto)
+
+    async def _count(extra) -> int:
+        stmt = select(func.count()).select_from(m.GuideMessage).where(and_(*base, extra))
+        return (await session.execute(stmt)).scalar_one()
+
+    total_unanswered = await _count(m.GuideMessage.answered.is_(False))
+    total_answered = await _count(m.GuideMessage.answered.is_(True))
+    unclassified = await _count(m.GuideMessage.answered.is_(None))
+
+    rows = (
+        await session.execute(
+            select(
+                trimmed.label("q"),
+                m.GuideMessage.fail_reason,
+                m.GuideMessage.exhibit_id,
+                func.count().label("c"),
+            )
+            .where(and_(*base, m.GuideMessage.answered.is_(False), func.length(trimmed) > 0))
+            .group_by(trimmed, m.GuideMessage.fail_reason, m.GuideMessage.exhibit_id)
+            .order_by(func.count().desc())
+            .limit(_QUESTION_FETCH_LIMIT)
+        )
+    ).all()
+
+    # Кластеризатор группирует формулировки, а привязки (причина отказа, экспонат)
+    # едут рядом как «полезная нагрузка» — их смысл ему знать не нужно.
+    texts: List[Tuple[str, int]] = []
+    payloads: List[List[Tuple[str, object]]] = []
+    reason_totals: Counter = Counter()
+    for question, reason, exhibit_id, count in rows:
+        texts.append((question, count))
+        tokens: List[Tuple[str, object]] = []
+        if reason:
+            tokens += [("reason", reason)] * count
+            reason_totals[reason] += count
+        if exhibit_id is not None:
+            tokens += [("exhibit", exhibit_id)] * count
+        payloads.append(tokens)
+
+    clusters = question_cluster.cluster_questions(texts, payloads)[:limit]
+
+    exhibit_ids = {
+        value for cluster in clusters for kind, value in cluster.payload if kind == "exhibit"
+    }
+    names = await _exhibit_names(session, exhibit_ids)
+
+    items: List[sch.AnalyticsUnansweredItem] = []
+    for cluster in clusters:
+        reasons = {value: n for (kind, value), n in cluster.payload.items() if kind == "reason"}
+        exhibits = Counter({value: n for (kind, value), n in cluster.payload.items() if kind == "exhibit"})
+        items.append(
+            sch.AnalyticsUnansweredItem(
+                question=cluster.question,
+                count=cluster.count,
+                variants=cluster.variants,
+                fail_reasons=reasons,
+                exhibits=[
+                    sch.AnalyticsTopItem(id=eid, name=names.get(eid), count=n)
+                    for eid, n in exhibits.most_common(5)
+                ],
+            )
+        )
+
+    classified = total_unanswered + total_answered
+    return sch.AnalyticsUnanswered(
+        from_=_iso(dfrom),
+        to=_iso(dto),
+        total_unanswered=total_unanswered,
+        total_answered=total_answered,
+        unanswered_rate=_rate(total_unanswered, classified),
+        unclassified=unclassified,
+        fail_reasons=dict(reason_totals),
+        items=items,
+    )
+
+
+# ── Аналитика: вовлечённость и метрики визита (C17 + §5/§6) ──────────────────
 _DURATION_BUCKETS = [("0–1 мин", 0, 60), ("1–5 мин", 60, 300), ("5–15 мин", 300, 900), ("15+ мин", 900, None)]
+
+
+async def _visit_rows(session: AsyncSession, dfrom: Optional[date], dto: Optional[date]) -> List:
+    """События периода, упорядоченные по (session_id, ts) — вход для разбиения на визиты.
+
+    Один индексный проход по диапазону `ts` (idx_events_ts) на весь отчёт.
+    Выборка целиком поднимается в память: разбиение на визиты, маршруты и разбор
+    поведения после неудачного распознавания — последовательные задачи, которые
+    в GROUP BY не выражаются. На накопленных за сезон данных отчёт считается не
+    при каждом открытии дашборда, а ночным джобом (§12), эндпоинт читает кэш.
+    """
+    conds = [m.Event.session_id.isnot(None)] + _range_conds(m.Event.ts, dfrom, dto)
+    return list(
+        (
+            await session.execute(
+                select(
+                    m.Event.session_id,
+                    m.Event.ts,
+                    m.Event.type,
+                    m.Event.exhibit_id,
+                    m.Event.hall_id,
+                    m.Event.props,
+                )
+                .where(and_(*conds))
+                .order_by(m.Event.session_id, m.Event.ts)
+            )
+        ).all()
+    )
 
 
 async def analytics_engagement(
     session: AsyncSession, dfrom: Optional[date], dto: Optional[date]
 ) -> sch.AnalyticsEngagement:
-    """Вовлечённость: время от первого события сессии до последнего.
+    """Вовлечённость: длительность ВИЗИТА и что посетитель успел за него сделать.
 
-    ``first_open`` = MIN(ts) по сессии (обычно событие ``app_open``),
-    ``last_interaction`` = MAX(ts). Длительность = их разница. Считаем среднее,
-    медиану, максимум и распределение по корзинам — без спец. событий, только по
-    ``events`` (session_id + ts).
+    Длительность считается по визитам, а не по сессии целиком: поток событий
+    режется по неактивности дольше SESSION_TIMEOUT_MINUTES (§5), поэтому
+    вкладка, открытая утром и вернувшаяся к жизни через четыре часа, даёт два
+    визита, а не один на четыре часа.
     """
-    conds = [m.Event.session_id.isnot(None)]
-    if dfrom is not None:
-        conds.append(m.Event.ts >= dfrom)
-    if dto is not None:
-        conds.append(m.Event.ts < dto)
-    rows = (
-        await session.execute(
-            select(
-                m.Event.session_id,
-                func.min(m.Event.ts),
-                func.max(m.Event.ts),
-                func.count(),
-            )
-            .where(and_(*conds))
-            .group_by(m.Event.session_id)
-        )
-    ).all()
+    rows = await _visit_rows(session, dfrom, dto)
 
     durations: List[float] = []
     event_counts: List[int] = []
-    for _sid, first, last, n in rows:
-        durations.append((last - first).total_seconds())
-        event_counts.append(n)
+    exhibit_counts: List[int] = []
+    question_counts: List[int] = []
+    sessions: Set = set()
+    with_chat = with_questions = with_app_open = 0
 
-    total = len(rows)
+    for session_id, events in visits.visits_by_session(rows):
+        sessions.add(session_id)
+        durations.append((events[-1].ts - events[0].ts).total_seconds())
+        event_counts.append(len(events))
+        exhibit_counts.append(
+            len({e.exhibit_id for e in events if e.type == "exhibit_view" and e.exhibit_id is not None})
+        )
+        questions = sum(1 for e in events if e.type == "chat_message")
+        question_counts.append(questions)
+        types = {e.type for e in events}
+        if "chat_open" in types:
+            with_chat += 1
+        if questions:
+            with_questions += 1
+        if "app_open" in types:
+            with_app_open += 1
+
+    total_visits = len(durations)
+    # Конверсия считается от визитов с app_open. Пока фронт не начал слать
+    # app_open, знаменателя не будет — тогда берём все визиты, иначе метрика
+    # выглядела бы нулевой при живом трафике.
+    denominator = with_app_open or total_visits
+
     buckets = [
         sch.AnalyticsDurationBucket(
-            label=label,
-            count=sum(1 for d in durations if d >= lo and (hi is None or d < hi)),
+            label=label, count=sum(1 for d in durations if d >= lo and (hi is None or d < hi))
         )
         for label, lo, hi in _DURATION_BUCKETS
     ]
     return sch.AnalyticsEngagement(
-        from_=dfrom.isoformat() if dfrom else None,
-        to=dto.isoformat() if dto else None,
-        total_sessions=total,
+        from_=_iso(dfrom),
+        to=_iso(dto),
+        total_sessions=len(sessions),
+        total_visits=total_visits,
         avg_duration_sec=round(statistics.fmean(durations), 1) if durations else 0.0,
         median_duration_sec=round(statistics.median(durations), 1) if durations else 0.0,
         max_duration_sec=round(max(durations), 1) if durations else 0.0,
         avg_events_per_session=round(statistics.fmean(event_counts), 2) if event_counts else 0.0,
+        avg_exhibits_per_session=round(statistics.fmean(exhibit_counts), 2) if exhibit_counts else 0.0,
+        avg_questions_per_session=round(statistics.fmean(question_counts), 2) if question_counts else 0.0,
+        sessions_with_chat=with_chat,
+        sessions_with_questions=with_questions,
+        sessions_with_app_open=with_app_open,
+        chat_conversion_rate=_rate(with_chat, denominator),
+        question_conversion_rate=_rate(with_questions, denominator),
         buckets=buckets,
     )
 
 
-# ── C18: маршрут пользователя по залам (агрегат по hall_view) ─────────────────
+# ── Аналитика: маршрут, точки выхода, повторные визиты (C18 + §7) ────────────
+_SESSIONS_PER_DEVICE_BUCKETS = [("1 визит", 1, 1), ("2 визита", 2, 2), ("3+ визита", 3, None)]
+
+
+async def _device_stats(session: AsyncSession, dfrom: Optional[date], dto: Optional[date]) -> Tuple[int, int, float, List[sch.AnalyticsSessionsPerDeviceBucket]]:
+    """Повторные визиты по анонимному device_id.
+
+    Сессии без `device_id` (данные до 03.08.2026, приватный режим браузера)
+    расчёт не ломают — каждая считается отдельным «одиночным» устройством.
+    """
+    conds = [m.Event.session_id.isnot(None)] + _range_conds(m.Event.ts, dfrom, dto)
+    rows = (
+        await session.execute(
+            select(m.Event.device_id, func.count(func.distinct(m.Event.session_id)))
+            .where(and_(*conds, m.Event.device_id.isnot(None)))
+            .group_by(m.Event.device_id)
+        )
+    ).all()
+    counts = [n for _device, n in rows]
+
+    anonymous = (
+        await session.execute(
+            select(func.count(func.distinct(m.Event.session_id))).where(
+                and_(*conds, m.Event.device_id.is_(None))
+            )
+        )
+    ).scalar_one()
+    counts += [1] * anonymous
+
+    total_devices = len(counts)
+    returning = sum(1 for n in counts if n >= 2)
+    avg = round(statistics.fmean(counts), 2) if counts else 0.0
+    hist = [
+        sch.AnalyticsSessionsPerDeviceBucket(
+            label=label, devices=sum(1 for n in counts if n >= lo and (hi is None or n <= hi))
+        )
+        for label, lo, hi in _SESSIONS_PER_DEVICE_BUCKETS
+    ]
+    return total_devices, returning, avg, hist
+
+
 async def analytics_routes(
     session: AsyncSession, dfrom: Optional[date], dto: Optional[date], limit: int = 10
 ) -> sch.AnalyticsRoutes:
-    """Маршрут по залам: посещения, точки входа, переходы A→B, частые пути.
+    """Маршрут по залам: посещения, входы, переходы A→B, пути, точки выхода, повторные визиты.
 
-    Строим последовательность залов на сессию из событий ``hall_view`` по ``ts``,
-    схлопывая подряд идущие повторы одного зала (переоткрытие карточек в том же
-    зале не считаем переходом).
+    Последовательность залов строится из `hall_view` внутри одного визита (§5),
+    подряд идущие повторы одного зала схлопываются — переоткрытие карточек в том
+    же зале переходом не считается.
     """
-    conds = [m.Event.type == "hall_view", m.Event.hall_id.isnot(None), m.Event.session_id.isnot(None)]
-    if dfrom is not None:
-        conds.append(m.Event.ts >= dfrom)
-    if dto is not None:
-        conds.append(m.Event.ts < dto)
-    rows = (
-        await session.execute(
-            select(m.Event.session_id, m.Event.hall_id)
-            .where(and_(*conds))
-            .order_by(m.Event.session_id, m.Event.ts)
-        )
-    ).all()
+    rows = await _visit_rows(session, dfrom, dto)
 
-    sequences: Dict[object, List[int]] = defaultdict(list)
-    for sid, hid in rows:
-        seq = sequences[sid]
-        if not seq or seq[-1] != hid:  # схлопываем подряд идущие дубли
-            seq.append(hid)
-
-    visits: Counter = Counter()
+    visits_count = 0
+    visit_lengths: List[int] = []
+    hall_visits: Counter = Counter()
     entries: Counter = Counter()
+    exits: Counter = Counter()
     transitions: Counter = Counter()
     paths: Counter = Counter()
-    lengths: List[int] = []
-    for seq in sequences.values():
-        if not seq:
+    exit_screens: Counter = Counter()
+
+    for _session_id, events in visits.visits_by_session(rows):
+        visits_count += 1
+        # Экран выхода — тип последнего СОДЕРЖАТЕЛЬНОГО события: `session_end`
+        # сам по себе ничего не говорит о том, откуда посетитель ушёл.
+        meaningful = [e for e in events if e.type != "session_end"]
+        exit_screens[(meaningful or events)[-1].type] += 1
+
+        sequence: List[int] = []
+        for event in events:
+            if event.type != "hall_view" or event.hall_id is None:
+                continue
+            if not sequence or sequence[-1] != event.hall_id:
+                sequence.append(event.hall_id)
+        if not sequence:
             continue
-        lengths.append(len(seq))
-        entries[seq[0]] += 1
-        visits.update(seq)
-        transitions.update(zip(seq, seq[1:]))
-        paths[tuple(seq)] += 1
+        visit_lengths.append(len(sequence))
+        entries[sequence[0]] += 1
+        exits[sequence[-1]] += 1
+        hall_visits.update(sequence)
+        transitions.update(zip(sequence, sequence[1:]))
+        paths[tuple(sequence)] += 1
 
-    all_ids: Set[int] = set(visits)
+    all_ids: Set[int] = set(hall_visits) | set(exits)
     for a, b in transitions:
-        all_ids.add(a)
-        all_ids.add(b)
+        all_ids.update((a, b))
     names = await _hall_names(session, all_ids)
+    total_devices, returning, avg_per_device, hist = await _device_stats(session, dfrom, dto)
 
-    total_sessions = len(lengths)
+    def _halls(counter: Counter) -> List[sch.AnalyticsRouteHall]:
+        return [
+            sch.AnalyticsRouteHall(id=h, name=names.get(h), count=c) for h, c in counter.most_common(limit)
+        ]
+
     return sch.AnalyticsRoutes(
-        from_=dfrom.isoformat() if dfrom else None,
-        to=dto.isoformat() if dto else None,
-        total_sessions_with_route=total_sessions,
-        avg_halls_per_session=round(statistics.fmean(lengths), 2) if lengths else 0.0,
-        top_hall_visits=[sch.AnalyticsRouteHall(id=h, name=names.get(h), count=c) for h, c in visits.most_common(limit)],
-        top_entry_halls=[sch.AnalyticsRouteHall(id=h, name=names.get(h), count=c) for h, c in entries.most_common(limit)],
+        from_=_iso(dfrom),
+        to=_iso(dto),
+        total_sessions_with_route=len(visit_lengths),
+        avg_halls_per_session=round(statistics.fmean(visit_lengths), 2) if visit_lengths else 0.0,
+        top_hall_visits=_halls(hall_visits),
+        top_entry_halls=_halls(entries),
+        top_exit_halls=_halls(exits),
+        top_exit_screens=[
+            sch.AnalyticsTopItem(name=screen, count=c) for screen, c in exit_screens.most_common(limit)
+        ],
         top_transitions=[
             sch.AnalyticsRouteTransition(
                 from_hall_id=a, from_hall_name=names.get(a), to_hall_id=b, to_hall_name=names.get(b), count=c
@@ -1025,9 +1307,381 @@ async def analytics_routes(
         ],
         top_paths=[
             sch.AnalyticsRoutePath(
-                halls=[sch.AnalyticsRouteHall(id=h, name=names.get(h), count=visits.get(h, 0)) for h in path],
+                halls=[sch.AnalyticsRouteHall(id=h, name=names.get(h), count=hall_visits.get(h, 0)) for h in path],
                 count=c,
             )
             for path, c in paths.most_common(limit)
+        ],
+        total_devices=total_devices,
+        returning_devices=returning,
+        avg_sessions_per_device=avg_per_device,
+        sessions_per_device_hist=hist,
+    )
+
+
+# ── Аналитика: статистика по экспонатам (§8) ─────────────────────────────────
+async def analytics_exhibits(
+    session: AsyncSession,
+    dfrom: Optional[date],
+    dto: Optional[date],
+    limit: int = 20,
+    order: str = "views",
+) -> sch.AnalyticsExhibits:
+    """Просмотры, вопросы, озвучки и распознавания по каждому экспонату.
+
+    Список строится ОТ каталога (`exhibits LEFT JOIN events`): экспонат, которого
+    никто не открывал, в `events` просто отсутствует, а заказчику нужны именно
+    такие «мёртвые» карточки. Фильтр периода стоит в условии JOIN, а не в WHERE —
+    иначе LEFT JOIN схлопнулся бы во внутренний и нули опять пропали бы.
+    """
+    join_conds = [m.Event.exhibit_id == m.Exhibit.id] + _range_conds(m.Event.ts, dfrom, dto)
+    views = func.count().filter(m.Event.type == "exhibit_view")
+    questions = func.count().filter(m.Event.type == "chat_message")
+    tts_plays = func.count().filter(m.Event.type.in_(_TTS_TYPES))
+    recognitions = func.count().filter(m.Event.type == "recognition")
+
+    stmt = (
+        select(
+            m.Exhibit.id,
+            m.Exhibit.name,
+            m.Hall.hall_number,
+            views.label("views"),
+            questions.label("questions"),
+            tts_plays.label("tts_plays"),
+            recognitions.label("recognitions"),
+        )
+        .select_from(m.Exhibit)
+        .outerjoin(m.Showcase, m.Showcase.id == m.Exhibit.showcase_id)
+        .outerjoin(m.Hall, m.Hall.id == m.Showcase.hall_id)
+        .outerjoin(m.Event, and_(*join_conds))
+        .group_by(m.Exhibit.id, m.Exhibit.name, m.Hall.hall_number)
+    )
+    if order == "questions":
+        stmt = stmt.order_by(questions.desc(), views.desc(), m.Exhibit.id)
+    elif order == "asc":  # «мёртвые» карточки — от наименее просматриваемых
+        stmt = stmt.order_by(views.asc(), questions.asc(), m.Exhibit.id)
+    else:
+        stmt = stmt.order_by(views.desc(), questions.desc(), m.Exhibit.id)
+    rows = (await session.execute(stmt.limit(limit))).all()
+
+    total_exhibits = (await session.execute(select(func.count()).select_from(m.Exhibit))).scalar_one()
+    # Считаем от каталога (NOT EXISTS), а не «всего минус просмотренные»: в events
+    # могут остаться id уже удалённых экспонатов, и разность занизила бы число.
+    seen = (
+        select(m.Event.id)
+        .where(and_(m.Event.type == "exhibit_view", m.Event.exhibit_id == m.Exhibit.id,
+                    *_range_conds(m.Event.ts, dfrom, dto)))
+        .exists()
+    )
+    never_viewed = (
+        await session.execute(select(func.count()).select_from(m.Exhibit).where(~seen))
+    ).scalar_one()
+
+    return sch.AnalyticsExhibits(
+        from_=_iso(dfrom),
+        to=_iso(dto),
+        order=order,
+        total_exhibits=total_exhibits,
+        never_viewed=never_viewed,
+        items=[
+            sch.AnalyticsExhibitRow(
+                id=eid, name=name, hall_number=hall_number,
+                views=v, questions=q, tts_plays=t, recognitions=r,
+            )
+            for eid, name, hall_number, v, q, t, r in rows
+        ],
+    )
+
+
+# ── Аналитика: качество распознавания (§9) ───────────────────────────────────
+async def analytics_recognition(
+    session: AsyncSession, dfrom: Optional[date], dto: Optional[date]
+) -> sch.AnalyticsRecognition:
+    """Успешность распознавания, фолбэк с топ-3 и что посетитель делает после неудачи.
+
+    Всё считается ОДНИМ проходом по событиям визита (§5): для каждого события
+    `recognition` смотрим, что было в этом же визите дальше — до следующей
+    попытки распознавания. Отдельных запросов на событие нет.
+    """
+    rows = await _visit_rows(session, dfrom, dto)
+
+    total = success = fallback_shown = fallback_converted = 0
+    abandoned = retried = 0
+    confidences: List[float] = []
+
+    for _session_id, events in visits.visits_by_session(rows):
+        for index, event in enumerate(events):
+            if event.type != "recognition":
+                continue
+            total += 1
+            confidence = _prop_float(event.props, "confidence")
+            if confidence is not None:
+                confidences.append(confidence)
+            recognized = _prop_bool(event.props, "recognized")
+            fallback = _prop_bool(event.props, "fallback")
+            if recognized:
+                success += 1
+
+            # Хвост визита до следующей попытки распознавания.
+            tail: List = []
+            next_recognition = False
+            for following in events[index + 1:]:
+                if following.type == "recognition":
+                    next_recognition = True
+                    break
+                tail.append(following)
+
+            if fallback:
+                fallback_shown += 1
+                # «Сконвертировался» — открыл карточку из показанных кандидатов.
+                # Кандидатов в событии нет, поэтому опираемся на источник открытия.
+                if any(
+                    e.type == "exhibit_view" and (e.props or {}).get("source") == "recognition" for e in tail
+                ):
+                    fallback_converted += 1
+
+            if not recognized:
+                if next_recognition:
+                    retried += 1
+                # «Ушёл» — после неудачи в визите не было ничего, кроме session_end.
+                # Повторная съёмка и открытие экспоната руками уходом не считаются.
+                elif not [e for e in tail if e.type != "session_end"]:
+                    abandoned += 1
+
+    failed = total - success
+    return sch.AnalyticsRecognition(
+        from_=_iso(dfrom),
+        to=_iso(dto),
+        total=total,
+        success=success,
+        success_rate=_rate(success, total),
+        fallback_shown=fallback_shown,
+        fallback_rate=_rate(fallback_shown, total),
+        fallback_converted=fallback_converted,
+        fallback_conversion_rate=_rate(fallback_converted, fallback_shown),
+        failed=failed,
+        abandoned_after_fail=abandoned,
+        abandonment_rate=_rate(abandoned, failed),
+        retry_after_fail=retried,
+        avg_confidence=round(statistics.fmean(confidences), 4) if confidences else 0.0,
+    )
+
+
+# ── Аналитика: ночной пересчёт агрегатов и кэш отчётов (§12) ─────────────────
+# По ТЗ реалтайм не требуется — данные обновляются раз в сутки. Отчёты считаются
+# джобом (scripts/rebuild_analytics.py) и складываются в analytics_reports;
+# эндпоинт отдаёт готовый payload и `updated_at`, чтобы музей видел «данные на
+# 03.08.2026 04:00», а не думал, что дашборд сломался.
+#
+# Кластеризация вопросов и разбор последовательностей событий в плоскую суточную
+# схему не ложатся, поэтому отчёт кэшируется целиком; плоские суточные счётчики
+# (события по типам, сессии, просмотры) живут отдельно в analytics_daily.
+def _period_key(dfrom: Optional[date], dto: Optional[date], variant: str = "") -> str:
+    """Ключ периода: '<from>:<to>[:<параметры>]' с пустыми частями для открытых границ."""
+    key = f"{_iso(dfrom) or ''}:{_iso(dto) or ''}"
+    return f"{key}:{variant}" if variant else key
+
+
+async def _store_report(
+    session: AsyncSession, report: str, key: str, dfrom: Optional[date], dto: Optional[date], result
+) -> None:
+    payload = result.model_dump(mode="json", by_alias=True)
+    stmt = pg_insert(m.AnalyticsReport).values(
+        report=report, period_key=key, period_from=dfrom, period_to=dto,
+        payload=payload, updated_at=result.updated_at,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[m.AnalyticsReport.report, m.AnalyticsReport.period_key],
+        set_={"payload": stmt.excluded.payload, "updated_at": stmt.excluded.updated_at,
+              "period_from": stmt.excluded.period_from, "period_to": stmt.excluded.period_to},
+    )
+    await session.execute(stmt)
+    await session.commit()
+
+
+async def cached_report(
+    session: AsyncSession,
+    report: str,
+    dfrom: Optional[date],
+    dto: Optional[date],
+    model_cls,
+    builder,
+    variant: str = "",
+    force: bool = False,
+):
+    """Отдать отчёт из кэша агрегатов; при промахе — посчитать и запомнить.
+
+    Запись старше ANALYTICS_CACHE_TTL_MINUTES считается устаревшей и
+    пересчитывается. `variant` разводит наборы параметров (limit/order), чтобы
+    отчёт с `limit=50` не подменялся кэшем от `limit=20`.
+    """
+    key = _period_key(dfrom, dto, variant)
+    now = datetime.now(timezone.utc)
+    if not force:
+        row = (
+            await session.execute(
+                select(m.AnalyticsReport).where(
+                    m.AnalyticsReport.report == report, m.AnalyticsReport.period_key == key
+                )
+            )
+        ).scalar_one_or_none()
+        ttl = timedelta(minutes=settings.analytics_cache_ttl_minutes)
+        if row is not None and now - row.updated_at <= ttl:
+            return model_cls.model_validate(row.payload)
+
+    result = await builder()
+    result.updated_at = now
+    await _store_report(session, report, key, dfrom, dto, result)
+    return result
+
+
+# Отчёты, которые прогревает ночной джоб (с параметрами по умолчанию).
+REPORTS = ("overview", "questions", "unanswered", "engagement", "routes", "exhibits", "recognition")
+
+
+async def build_report(
+    session: AsyncSession, report: str, dfrom: Optional[date], dto: Optional[date], force: bool = False
+):
+    """Отчёт по имени с параметрами по умолчанию: из кэша, либо пересчёт при `force`."""
+    builders = {
+        "overview": (sch.AnalyticsOverview, lambda: analytics_overview(session, dfrom, dto)),
+        "questions": (sch.AnalyticsQuestions, lambda: analytics_questions(session, dfrom, dto)),
+        "unanswered": (sch.AnalyticsUnanswered, lambda: analytics_unanswered(session, dfrom, dto)),
+        "engagement": (sch.AnalyticsEngagement, lambda: analytics_engagement(session, dfrom, dto)),
+        "routes": (sch.AnalyticsRoutes, lambda: analytics_routes(session, dfrom, dto)),
+        "exhibits": (sch.AnalyticsExhibits, lambda: analytics_exhibits(session, dfrom, dto)),
+        "recognition": (sch.AnalyticsRecognition, lambda: analytics_recognition(session, dfrom, dto)),
+    }
+    model_cls, builder = builders[report]
+    return await cached_report(session, report, dfrom, dto, model_cls, builder, force=force)
+
+
+# Плоские суточные метрики. Каждая — отдельный GROUP BY по дню; дороже одного
+# запроса, но читаемо и не требует ручной раскладки CASE-ов.
+async def rebuild_daily(session: AsyncSession, dfrom: Optional[date], dto: Optional[date]) -> Tuple[int, int]:
+    """Пересчитать analytics_daily за период. Идемпотентно: строки за пересчитанные дни удаляются и пишутся заново."""
+    day = func.date(m.Event.ts).label("d")
+    ev_conds = _range_conds(m.Event.ts, dfrom, dto)
+    values: List[dict] = []
+
+    def _add(rows, metric: str, with_dimension: bool = False) -> None:
+        for row in rows:
+            if with_dimension:
+                d, dim, value = row
+                if dim is None:
+                    continue
+                values.append({
+                    "date": d, "metric": metric, "dimension_key": str(dim),
+                    "dimension_id": dim if isinstance(dim, int) else None, "value": float(value),
+                })
+            else:
+                d, value = row
+                values.append({"date": d, "metric": metric, "dimension_key": "",
+                               "dimension_id": None, "value": float(value)})
+
+    base = select(day, func.count()).group_by(day)
+    if ev_conds:
+        base = base.where(and_(*ev_conds))
+    _add((await session.execute(base)).all(), "events_total")
+
+    by_type = select(day, m.Event.type, func.count()).group_by(day, m.Event.type)
+    if ev_conds:
+        by_type = by_type.where(and_(*ev_conds))
+    _add((await session.execute(by_type)).all(), "events_by_type", with_dimension=True)
+
+    sessions_stmt = select(day, func.count(func.distinct(m.Event.session_id))).group_by(day)
+    if ev_conds:
+        sessions_stmt = sessions_stmt.where(and_(*ev_conds))
+    _add((await session.execute(sessions_stmt)).all(), "sessions")
+
+    views_stmt = (
+        select(day, m.Event.exhibit_id, func.count())
+        .where(and_(m.Event.type == "exhibit_view", m.Event.exhibit_id.isnot(None), *ev_conds))
+        .group_by(day, m.Event.exhibit_id)
+    )
+    _add((await session.execute(views_stmt)).all(), "exhibit_views", with_dimension=True)
+
+    halls_stmt = (
+        select(day, m.Event.hall_id, func.count())
+        .where(and_(m.Event.type == "hall_view", m.Event.hall_id.isnot(None), *ev_conds))
+        .group_by(day, m.Event.hall_id)
+    )
+    _add((await session.execute(halls_stmt)).all(), "hall_views", with_dimension=True)
+
+    success_stmt = (
+        select(day, func.count())
+        .where(and_(m.Event.type == "recognition",
+                    cast(m.Event.props["recognized"].astext, String) == "true", *ev_conds))
+        .group_by(day)
+    )
+    _add((await session.execute(success_stmt)).all(), "recognition_success")
+
+    msg_day = func.date(m.GuideMessage.created_at).label("d")
+    msg_conds = [m.GuideMessage.role == "user"] + _range_conds(m.GuideMessage.created_at, dfrom, dto)
+    msg_stmt = select(msg_day, func.count()).where(and_(*msg_conds)).group_by(msg_day)
+    _add((await session.execute(msg_stmt)).all(), "chat_messages")
+
+    unanswered_stmt = (
+        select(msg_day, func.count())
+        .where(and_(*msg_conds, m.GuideMessage.answered.is_(False)))
+        .group_by(msg_day)
+    )
+    _add((await session.execute(unanswered_stmt)).all(), "chat_messages_unanswered")
+
+    days = {row["date"] for row in values}
+    if days:
+        await session.execute(sa_delete(m.AnalyticsDaily).where(m.AnalyticsDaily.date.in_(list(days))))
+        # Одна дата+метрика+измерение может прийти из разных запросов только при
+        # совпадении ключа — на всякий случай схлопываем, чтобы не словить
+        # нарушение первичного ключа на пакетной вставке.
+        unique = {(row["date"], row["metric"], row["dimension_key"]): row for row in values}
+        await session.execute(pg_insert(m.AnalyticsDaily), list(unique.values()))
+        await session.commit()
+        return len(days), len(unique)
+    await session.commit()
+    return 0, 0
+
+
+async def rebuild_analytics(
+    session: AsyncSession, dfrom: Optional[date] = None, dto: Optional[date] = None
+) -> sch.AnalyticsRebuildResult:
+    """Пересчитать суточный срез и прогреть кэш всех отчётов за период."""
+    days, rows = await rebuild_daily(session, dfrom, dto)
+    for report in REPORTS:
+        await build_report(session, report, dfrom, dto, force=True)
+    return sch.AnalyticsRebuildResult(
+        rebuilt_reports=list(REPORTS),
+        daily_days=days,
+        daily_rows=rows,
+        updated_at=datetime.now(timezone.utc),
+    )
+
+
+async def analytics_daily_series(
+    session: AsyncSession, dfrom: Optional[date], dto: Optional[date], metric: Optional[str] = None
+) -> sch.AnalyticsDailySeries:
+    """Суточный ряд из analytics_daily — то, что заполняет ночной джоб."""
+    conds = _range_conds(m.AnalyticsDaily.date, dfrom, dto)
+    if metric:
+        conds.append(m.AnalyticsDaily.metric == metric)
+    stmt = select(m.AnalyticsDaily)
+    if conds:
+        stmt = stmt.where(and_(*conds))
+    rows = (
+        await session.execute(
+            stmt.order_by(m.AnalyticsDaily.date, m.AnalyticsDaily.metric, m.AnalyticsDaily.dimension_key)
+        )
+    ).scalars().all()
+    updated = max((r.updated_at for r in rows), default=None)
+    return sch.AnalyticsDailySeries(
+        from_=_iso(dfrom),
+        to=_iso(dto),
+        updated_at=updated,
+        points=[
+            sch.AnalyticsDailyPoint(
+                date=r.date.isoformat(), metric=r.metric, dimension_key=r.dimension_key,
+                dimension_id=r.dimension_id, value=r.value,
+            )
+            for r in rows
         ],
     )

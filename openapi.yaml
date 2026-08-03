@@ -1419,26 +1419,42 @@ paths:
         Агрегированные показатели использования за период: сессии,
         распознавания, доля успешных распознаваний, сообщения в чате,
         прослушивания аудио, топ экспонатов и залов.
+
+
+        Отдаётся из кэша агрегатов: реалтайм по ТЗ не требуется, данные
+        обновляются раз в сутки ночным джобом. Время пересчёта — в `updated_at`.
       operationId: getAnalyticsOverview
       security:
         - bearerAuth: []
       parameters:
         - name: from
           in: query
-          description: Начало периода (ISO-8601 дата).
+          description: Начало периода (ISO-8601 дата), включительно.
           required: false
           schema:
             type: string
             format: date
-          example: '2026-05-25'
+          example: '2026-07-01'
         - name: to
           in: query
-          description: Конец периода (ISO-8601 дата).
+          description: >-
+            Конец периода (ISO-8601 дата), ВКЛЮЧИТЕЛЬНО: from=2026-07-01&to=2026-07-31
+            отдаёт и события 31 июля. До 03.08.2026 граница была исключающей, и
+            последний день периода молча терялся.
           required: false
           schema:
             type: string
             format: date
-          example: '2026-06-25'
+          example: '2026-07-31'
+        - name: limit
+          in: query
+          description: Размер топов экспонатов и залов.
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 50
+            default: 5
       responses:
         '200':
           description: Сводные показатели.
@@ -1455,26 +1471,38 @@ paths:
     get:
       tags: [Администрирование]
       summary: 'Аналитика: частые и редкие вопросы'
+      description: >-
+        Реплики посетителей, сгруппированные ПО СМЫСЛУ: «Сколько стоит яйцо?»,
+        «какая цена яйца» и «Сколько это стоит» попадают в один кластер.
+        У кластера есть представитель (`question` — самая частая формулировка),
+        `variants` (другие формулировки) и суммарный `count`.
+
+
+        `rare` — кластеры не чаще ANALYTICS_RARE_MAX_COUNT раз; с `frequent`
+        они не пересекаются.
       operationId: getAnalyticsQuestions
       security:
         - bearerAuth: []
       parameters:
         - name: from
           in: query
-          description: Начало периода (ISO-8601 дата).
+          description: Начало периода (ISO-8601 дата), включительно.
           required: false
           schema:
             type: string
             format: date
-          example: '2026-05-25'
+          example: '2026-07-01'
         - name: to
           in: query
-          description: Конец периода (ISO-8601 дата).
+          description: >-
+            Конец периода (ISO-8601 дата), ВКЛЮЧИТЕЛЬНО: from=2026-07-01&to=2026-07-31
+            отдаёт и события 31 июля. До 03.08.2026 граница была исключающей, и
+            последний день периода молча терялся.
           required: false
           schema:
             type: string
             format: date
-          example: '2026-06-25'
+          example: '2026-07-31'
         - name: limit
           in: query
           description: Максимум вопросов в каждой коллекции (частые/редкие).
@@ -1497,27 +1525,40 @@ paths:
   /admin/analytics/engagement:
     get:
       tags: [Администрирование]
-      summary: 'Аналитика: длительность сессии'
+      summary: 'Аналитика: длительность визита и вовлечённость'
+      description: >-
+        Длительность считается по ВИЗИТАМ: поток событий сессии режется по
+        неактивности дольше SESSION_TIMEOUT_MINUTES (30 минут). Вкладка,
+        открытая утром и ожившая через четыре часа, даёт два визита, а не один
+        на четыре часа, и расчёт не зависит от того, дошёл ли `session_end`.
+
+
+        Кроме длительности: сколько экспонатов посмотрели и вопросов задали за
+        визит и какая доля дошла до диалога с гидом. Знаменатель конверсий —
+        визиты с `app_open`; пока фронт его не шлёт, берутся все визиты.
       operationId: getAnalyticsEngagement
       security:
         - bearerAuth: []
       parameters:
         - name: from
           in: query
-          description: Начало периода (ISO-8601 дата).
+          description: Начало периода (ISO-8601 дата), включительно.
           required: false
           schema:
             type: string
             format: date
-          example: '2026-05-25'
+          example: '2026-07-01'
         - name: to
           in: query
-          description: Конец периода (ISO-8601 дата).
+          description: >-
+            Конец периода (ISO-8601 дата), ВКЛЮЧИТЕЛЬНО: from=2026-07-01&to=2026-07-31
+            отдаёт и события 31 июля. До 03.08.2026 граница была исключающей, и
+            последний день периода молча терялся.
           required: false
           schema:
             type: string
             format: date
-          example: '2026-06-25'
+          example: '2026-07-31'
       responses:
         '200':
           description: Длительность сессий.
@@ -1531,27 +1572,44 @@ paths:
   /admin/analytics/routes:
     get:
       tags: [Администрирование]
-      summary: 'Аналитика: маршрут пользователя по залам'
+      summary: 'Аналитика: маршрут по залам, точки выхода, повторные визиты'
+      description: >-
+        Маршруты по залам из событий hall_view внутри визита: посещения, точки
+        входа, переходы A→B, частые пути.
+
+
+        Точки выхода: `top_exit_halls` — последний зал визита,
+        `top_exit_screens` — тип последнего содержательного события (часть
+        посетителей уходит из чата, а не из зала).
+
+
+        Повторные визиты считаются по анонимному `device_id`, а не по
+        `session_id` (тот живёт в sessionStorage, новая вкладка = новый
+        «человек»). Сессии без `device_id` расчёт не ломают — считаются
+        одиночными устройствами.
       operationId: getAnalyticsRoutes
       security:
         - bearerAuth: []
       parameters:
         - name: from
           in: query
-          description: Начало периода (ISO-8601 дата).
+          description: Начало периода (ISO-8601 дата), включительно.
           required: false
           schema:
             type: string
             format: date
-          example: '2026-05-25'
+          example: '2026-07-01'
         - name: to
           in: query
-          description: Конец периода (ISO-8601 дата).
+          description: >-
+            Конец периода (ISO-8601 дата), ВКЛЮЧИТЕЛЬНО: from=2026-07-01&to=2026-07-31
+            отдаёт и события 31 июля. До 03.08.2026 граница была исключающей, и
+            последний день периода молча терялся.
           required: false
           schema:
             type: string
             format: date
-          example: '2026-06-25'
+          example: '2026-07-31'
         - name: limit
           in: query
           description: Максимум элементов в топах маршрута.
@@ -1571,16 +1629,372 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
 
+  /admin/analytics/unanswered:
+    get:
+      tags: [Администрирование]
+      summary: 'Аналитика: вопросы, на которые гид не смог ответить'
+      description: >-
+        Показывает, чего не хватает в описаниях экспонатов. Признак `answered` и
+        причина отказа проставляются в момент генерации ответа: `no_context` —
+        не было справки, `llm_refusal` — модель отказалась при наличии
+        материалов, `not_found` — экспонат не найден в каталоге, `error` — сбой
+        LLM.
+
+
+        Вопросы сгруппированы тем же кластеризатором, что и
+        /admin/analytics/questions, и привязаны к экспонатам из контекста
+        запроса. Сообщения, накопленные до 03.08.2026, признака не имеют и
+        попадают в `unclassified` (разовый бэкфилл —
+        `scripts/backfill_unanswered.py`).
+      operationId: getAnalyticsUnanswered
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: from
+          in: query
+          description: Начало периода (ISO-8601 дата), включительно.
+          required: false
+          schema:
+            type: string
+            format: date
+          example: '2026-07-01'
+        - name: to
+          in: query
+          description: >-
+            Конец периода (ISO-8601 дата), ВКЛЮЧИТЕЛЬНО: from=2026-07-01&to=2026-07-31
+            отдаёт и события 31 июля. До 03.08.2026 граница была исключающей, и
+            последний день периода молча терялся.
+          required: false
+          schema:
+            type: string
+            format: date
+          example: '2026-07-31'
+        - name: limit
+          in: query
+          description: Максимум кластеров в выдаче.
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: Вопросы без ответа, сгруппированные по смыслу.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsUnanswered'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /admin/analytics/exhibits:
+    get:
+      tags: [Администрирование]
+      summary: 'Аналитика: статистика по экспонатам'
+      description: >-
+        Просмотры, вопросы гиду, озвучки и распознавания по каждому экспонату.
+        Список строится от каталога (exhibits LEFT JOIN events), поэтому
+        экспонат, которого никто не открывал, присутствует в выдаче с
+        `views: 0` — из одних events такие «мёртвые» карточки не выводятся.
+      operationId: getAnalyticsExhibits
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: from
+          in: query
+          description: Начало периода (ISO-8601 дата), включительно.
+          required: false
+          schema:
+            type: string
+            format: date
+          example: '2026-07-01'
+        - name: to
+          in: query
+          description: >-
+            Конец периода (ISO-8601 дата), ВКЛЮЧИТЕЛЬНО: from=2026-07-01&to=2026-07-31
+            отдаёт и события 31 июля. До 03.08.2026 граница была исключающей, и
+            последний день периода молча терялся.
+          required: false
+          schema:
+            type: string
+            format: date
+          example: '2026-07-31'
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 500
+            default: 20
+        - name: order
+          in: query
+          description: >-
+            views — топ по просмотрам; questions — топ по вопросам к ИИ-гиду
+            (это не то же самое); asc — от наименее просматриваемых.
+          required: false
+          schema:
+            type: string
+            enum: [views, questions, asc]
+            default: views
+      responses:
+        '200':
+          description: Статистика по экспонатам.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsExhibits'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+
+  /admin/analytics/recognition:
+    get:
+      tags: [Администрирование]
+      summary: 'Аналитика: качество распознавания по фото'
+      description: >-
+        Успешность распознавания, частота фолбэка с топ-3 кандидатов и поведение
+        после неудачи. «Ушёл» — если после неуспешной попытки в визите не было
+        ни одного события, кроме `session_end`: повторная съёмка и открытие
+        экспоната руками уходом не считаются.
+      operationId: getAnalyticsRecognition
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: from
+          in: query
+          description: Начало периода (ISO-8601 дата), включительно.
+          required: false
+          schema:
+            type: string
+            format: date
+          example: '2026-07-01'
+        - name: to
+          in: query
+          description: >-
+            Конец периода (ISO-8601 дата), ВКЛЮЧИТЕЛЬНО: from=2026-07-01&to=2026-07-31
+            отдаёт и события 31 июля. До 03.08.2026 граница была исключающей, и
+            последний день периода молча терялся.
+          required: false
+          schema:
+            type: string
+            format: date
+          example: '2026-07-31'
+      responses:
+        '200':
+          description: Метрики качества распознавания.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsRecognition'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/analytics/daily:
+    get:
+      tags: [Администрирование]
+      summary: 'Аналитика: суточный срез агрегатов'
+      description: >-
+        Плоский временной ряд из таблицы analytics_daily, которую заполняет
+        ночной джоб: events_total, events_by_type, sessions, exhibit_views,
+        hall_views, recognition_success, chat_messages,
+        chat_messages_unanswered. Пока джоб не отработал, ряд пуст — запустите
+        POST /admin/analytics/rebuild.
+      operationId: getAnalyticsDaily
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: from
+          in: query
+          description: Начало периода (ISO-8601 дата), включительно.
+          required: false
+          schema:
+            type: string
+            format: date
+          example: '2026-07-01'
+        - name: to
+          in: query
+          description: >-
+            Конец периода (ISO-8601 дата), ВКЛЮЧИТЕЛЬНО: from=2026-07-01&to=2026-07-31
+            отдаёт и события 31 июля. До 03.08.2026 граница была исключающей, и
+            последний день периода молча терялся.
+          required: false
+          schema:
+            type: string
+            format: date
+          example: '2026-07-31'
+        - name: metric
+          in: query
+          description: Фильтр по имени метрики.
+          required: false
+          schema:
+            type: string
+          example: events_by_type
+      responses:
+        '200':
+          description: Суточный ряд.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsDailySeries'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/analytics/rebuild:
+    post:
+      tags: [Администрирование]
+      summary: 'Аналитика: пересчитать агрегаты вручную'
+      description: >-
+        Пересчитывает суточный срез и прогревает кэш всех отчётов за период —
+        чтобы не ждать ночного джоба при отладке и демонстрации. Идемпотентно:
+        повторный запуск за ту же дату перезаписывает строки, а не удваивает
+        цифры. То же самое из cron: `python scripts/rebuild_analytics.py`.
+      operationId: rebuildAnalytics
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: from
+          in: query
+          description: Начало периода (ISO-8601 дата), включительно.
+          required: false
+          schema:
+            type: string
+            format: date
+          example: '2026-07-01'
+        - name: to
+          in: query
+          description: >-
+            Конец периода (ISO-8601 дата), ВКЛЮЧИТЕЛЬНО: from=2026-07-01&to=2026-07-31
+            отдаёт и события 31 июля. До 03.08.2026 граница была исключающей, и
+            последний день периода молча терялся.
+          required: false
+          schema:
+            type: string
+            format: date
+          example: '2026-07-31'
+      responses:
+        '200':
+          description: Итог пересчёта.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AnalyticsRebuildResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/analytics/export:
+    get:
+      tags: [Администрирование]
+      summary: 'Аналитика: выгрузка отчёта в .xlsx / .pdf'
+      description: >-
+        Отдаёт отчёт файлом за тем же Bearer, что и остальная админка.
+        `.xlsx` — один лист на отчёт, числа числами (музей сводит их в Excel
+        формулами). `.pdf` — таблицы с шапкой периода и датой формирования.
+
+
+        Кириллица в PDF требует TTF-шрифта: путь задаётся переменной окружения
+        ANALYTICS_PDF_FONT_PATH либо файл кладётся в assets/fonts/DejaVuSans.ttf.
+        Без шрифта эндпоинт возвращает 503, а не лист с квадратами.
+
+
+        Имя файла — `faberge-<report>-<from>-<to>.<ext>`.
+      operationId: exportAnalytics
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: report
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [overview, questions, unanswered, exhibits, routes, recognition]
+        - name: format
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [xlsx, pdf]
+            default: xlsx
+        - name: from
+          in: query
+          description: Начало периода (ISO-8601 дата), включительно.
+          required: false
+          schema:
+            type: string
+            format: date
+          example: '2026-07-01'
+        - name: to
+          in: query
+          description: >-
+            Конец периода (ISO-8601 дата), ВКЛЮЧИТЕЛЬНО: from=2026-07-01&to=2026-07-31
+            отдаёт и события 31 июля. До 03.08.2026 граница была исключающей, и
+            последний день периода молча терялся.
+          required: false
+          schema:
+            type: string
+            format: date
+          example: '2026-07-31'
+      responses:
+        '200':
+          description: Файл отчёта.
+          headers:
+            Content-Disposition:
+              description: attachment; filename="faberge-<report>-<from>-<to>.<ext>"
+              schema:
+                type: string
+          content:
+            application/vnd.openxmlformats-officedocument.spreadsheetml.sheet:
+              schema:
+                type: string
+                format: binary
+            application/pdf:
+              schema:
+                type: string
+                format: binary
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '503':
+          description: >-
+            Выгрузка недоступна: не установлена библиотека (openpyxl/reportlab)
+            либо не найден шрифт с кириллицей для PDF.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
   # ───────────────────────────── Телеметрия ──────────────────────────────
   /telemetry/events:
     post:
       tags: [Телеметрия]
       summary: Отправить события
       description: >-
-        Пакетный приём анонимных пользовательских событий (app_open, hall_view,
-        exhibit_view, recognition, audio_play) — источник данных для
+        Пакетный приём анонимных пользовательских событий — источник данных для
         административной аналитики. С 21.07.2026 — обязательная часть контракта:
         без событий GET /admin/analytics/engagement и /analytics/routes пусты (B11).
+
+
+        Контракт с 03.08.2026:
+
+        * не более 50 событий в батче, иначе 422;
+
+        * событие с типом вне словаря НЕ роняет батч — оно отбрасывается,
+        остальные записываются, число отброшенных возвращается в `rejected`;
+
+        * устаревший `audio_play` нормализуется в канонический `tts_play`;
+
+        * в `props` сохраняются только ключи из контракта события, остальные
+        (в т.ч. user_agent, ip, url, geo) отбрасываются; `props.text` длиннее
+        500 символов обрезается.
+
+
+        Приватность: IP и User-Agent запроса не читаются и не сохраняются —
+        ни в events, ни в логи (docs/analytics-privacy.md).
       operationId: ingestEvents
       security: []
       requestBody:
@@ -1592,6 +2006,13 @@ paths:
       responses:
         '202':
           description: События приняты в обработку.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventIngestResult'
+              example:
+                accepted: 9
+                rejected: 1
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
 
@@ -2929,6 +3350,10 @@ components:
       properties:
         id:
           type: integer
+          nullable: true
+          description: >-
+            null у элементов без сущности в каталоге — например, у «экранов
+            выхода» (top_exit_screens), где значимо только имя типа события.
           example: 101
         name:
           type: string
@@ -2950,6 +3375,15 @@ components:
           format: date
           nullable: true
           example: '2026-06-25'
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            Время последнего пересчёта агрегатов. Фронт показывает «данные на
+            03.08.2026 04:00» — иначе отсутствие сегодняшних цифр выглядит как
+            поломка дашборда.
+          example: '2026-08-03T04:00:00Z'
         total_sessions:
           type: integer
           example: 1240
@@ -2984,20 +3418,32 @@ components:
 
     AnalyticsQuestionItem:
       type: object
+      description: Смысловая группа вопросов (кластер), а не отдельная формулировка.
       required: [question, count]
       properties:
         question:
           type: string
+          description: Представитель кластера — самая частая формулировка.
           example: Кому подарили это яйцо?
         count:
           type: integer
+          description: Суммарно по кластеру.
           example: 42
+        variants:
+          type: array
+          description: >-
+            Другие формулировки того же смысла (до 5) — музею важно видеть, КАК
+            спрашивают.
+          items:
+            type: string
+          example: ['кому его подарили', 'для кого сделали яйцо']
 
     AnalyticsQuestions:
       type: object
       description: >-
-        Частые/редкие вопросы посетителей (агрегат по guide_messages,
-        role=user).
+        Вопросы посетителей (агрегат по guide_messages, role=user),
+        сгруппированные ПО СМЫСЛУ: «Сколько стоит яйцо?», «какая цена яйца» и
+        «Сколько это стоит» попадают в один кластер.
       properties:
         from:
           type: string
@@ -3007,20 +3453,35 @@ components:
           type: string
           nullable: true
           example: '2026-06-25'
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2026-08-03T04:00:00Z'
         total_questions:
           type: integer
           default: 0
+          description: Всего реплик посетителей.
           example: 3450
         unique_questions:
           type: integer
           default: 0
+          description: Различных формулировок (до кластеризации).
           example: 512
+        total_clusters:
+          type: integer
+          default: 0
+          description: Смысловых групп вопросов.
+          example: 84
         frequent:
           type: array
           items:
             $ref: '#/components/schemas/AnalyticsQuestionItem'
         rare:
           type: array
+          description: >-
+            Кластеры, встретившиеся не чаще ANALYTICS_RARE_MAX_COUNT раз.
+            С frequent не пересекаются.
           items:
             $ref: '#/components/schemas/AnalyticsQuestionItem'
 
@@ -3038,7 +3499,10 @@ components:
     AnalyticsEngagement:
       type: object
       description: >-
-        Время от первого открытия сессии до последнего взаимодействия.
+        Длительность ВИЗИТА и вовлечённость. Поток событий сессии режется по
+        неактивности дольше SESSION_TIMEOUT_MINUTES (30 минут), поэтому вкладка,
+        открытая утром и ожившая через четыре часа, даёт два визита, а не один
+        на четыре часа — и расчёт не зависит от того, дошёл ли session_end.
       properties:
         from:
           type: string
@@ -3048,9 +3512,15 @@ components:
           type: string
           nullable: true
           example: '2026-06-25'
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2026-08-03T04:00:00Z'
         total_sessions:
           type: integer
           default: 0
+          description: Различных session_id за период.
           example: 1240
         avg_duration_sec:
           type: number
@@ -3064,10 +3534,58 @@ components:
           type: number
           default: 0
           example: 1820
+        total_visits:
+          type: integer
+          default: 0
+          description: Визитов после разбиения сессий по таймауту (≥ total_sessions).
+          example: 1310
         avg_events_per_session:
           type: number
           default: 0
           example: 7.3
+        avg_exhibits_per_session:
+          type: number
+          default: 0
+          description: Среднее число уникальных exhibit_view за визит.
+          example: 4.1
+        avg_questions_per_session:
+          type: number
+          default: 0
+          description: Среднее число chat_message за визит.
+          example: 1.2
+        sessions_with_chat:
+          type: integer
+          default: 0
+          description: Визитов хотя бы с одним chat_open.
+          example: 410
+        sessions_with_questions:
+          type: integer
+          default: 0
+          description: Визитов хотя бы с одним chat_message.
+          example: 320
+        sessions_with_app_open:
+          type: integer
+          default: 0
+          description: >-
+            Знаменатель конверсий. Если app_open не приходил ни разу (фронт ещё
+            не шлёт), знаменателем становится total_visits.
+          example: 1300
+        chat_conversion_rate:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          default: 0
+          description: Доля визитов, дошедших до экрана чата с гидом.
+          example: 0.32
+        question_conversion_rate:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          default: 0
+          description: Доля визитов, в которых задали хотя бы один вопрос.
+          example: 0.25
         buckets:
           type: array
           items:
@@ -3122,10 +3640,22 @@ components:
           type: integer
           example: 54
 
+    AnalyticsSessionsPerDeviceBucket:
+      type: object
+      required: [label, devices]
+      properties:
+        label:
+          type: string
+          example: 3+ визита
+        devices:
+          type: integer
+          example: 42
+
     AnalyticsRoutes:
       type: object
       description: >-
-        Маршрут пользователя по залам (агрегат по событиям hall_view).
+        Маршрут по залам, точки выхода и повторные визиты. Последовательность
+        залов строится из событий hall_view внутри одного визита.
       properties:
         from:
           type: string
@@ -3135,6 +3665,11 @@ components:
           type: string
           nullable: true
           example: '2026-06-25'
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2026-08-03T04:00:00Z'
         total_sessions_with_route:
           type: integer
           default: 0
@@ -3159,6 +3694,345 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AnalyticsRoutePath'
+        top_exit_halls:
+          type: array
+          description: Залы, на которых чаще всего заканчивается визит (последний hall_view).
+          items:
+            $ref: '#/components/schemas/AnalyticsRouteHall'
+        top_exit_screens:
+          type: array
+          description: >-
+            Тип последнего содержательного события визита. Часть посетителей
+            уходит из чата или с экрана распознавания, а не из зала, поэтому
+            одних «залов выхода» недостаточно. У элементов id = null.
+          items:
+            $ref: '#/components/schemas/AnalyticsTopItem'
+        total_devices:
+          type: integer
+          default: 0
+          description: >-
+            Устройств за период. Сессии без device_id (данные до 03.08.2026,
+            приватный режим браузера) считаются одиночными устройствами.
+          example: 860
+        returning_devices:
+          type: integer
+          default: 0
+          description: Устройств с двумя и более сессиями.
+          example: 120
+        avg_sessions_per_device:
+          type: number
+          default: 0
+          example: 1.4
+        sessions_per_device_hist:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalyticsSessionsPerDeviceBucket'
+
+    # ── Аналитика: вопросы без ответа гида ──
+    AnalyticsUnansweredItem:
+      type: object
+      required: [question, count]
+      properties:
+        question:
+          type: string
+          description: Представитель кластера — самая частая формулировка.
+          example: Что спрятано внутри яйца?
+        count:
+          type: integer
+          example: 17
+        variants:
+          type: array
+          items:
+            type: string
+        fail_reasons:
+          type: object
+          description: Сколько раз сработала каждая причина отказа.
+          additionalProperties:
+            type: integer
+          example: {no_context: 12, llm_refusal: 5}
+        exhibits:
+          type: array
+          description: >-
+            Экспонаты, у карточек которых задавали эти вопросы — там и не
+            хватает описания.
+          items:
+            $ref: '#/components/schemas/AnalyticsTopItem'
+
+    AnalyticsUnanswered:
+      type: object
+      description: >-
+        Вопросы, на которые гид не смог ответить. Признак проставляется в момент
+        генерации ответа, а не постфактум: отличить содержательный ответ от
+        вежливого отказа по тексту в БД уже невозможно.
+      properties:
+        from:
+          type: string
+          nullable: true
+          example: '2026-05-25'
+        to:
+          type: string
+          nullable: true
+          example: '2026-06-25'
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2026-08-03T04:00:00Z'
+        total_unanswered:
+          type: integer
+          default: 0
+          example: 210
+        total_answered:
+          type: integer
+          default: 0
+          example: 3240
+        unanswered_rate:
+          type: number
+          format: float
+          minimum: 0
+          maximum: 1
+          default: 0
+          description: Доля среди вопросов с проставленным признаком.
+          example: 0.061
+        unclassified:
+          type: integer
+          default: 0
+          description: >-
+            Вопросы без признака (накоплены до 03.08.2026). В расчёт доли не
+            входят; разовый бэкфилл — scripts/backfill_unanswered.py.
+          example: 480
+        fail_reasons:
+          type: object
+          additionalProperties:
+            type: integer
+          example: {no_context: 150, llm_refusal: 40, not_found: 15, error: 5}
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalyticsUnansweredItem'
+
+    # ── Аналитика: статистика по экспонатам ──
+    AnalyticsExhibitRow:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: integer
+          example: 101
+        name:
+          type: string
+          nullable: true
+          example: Яйцо «Коронационное»
+        hall_number:
+          type: integer
+          nullable: true
+          example: 3
+        views:
+          type: integer
+          default: 0
+          example: 187
+        questions:
+          type: integer
+          default: 0
+          description: Число chat_message с этим exhibit_id.
+          example: 34
+        tts_plays:
+          type: integer
+          default: 0
+          example: 55
+        recognitions:
+          type: integer
+          default: 0
+          example: 12
+
+    AnalyticsExhibits:
+      type: object
+      description: >-
+        Список строится ОТ каталога (exhibits LEFT JOIN events), поэтому
+        экспонат, которого никто не открывал, присутствует с views = 0 — из
+        одних events такие «мёртвые» карточки не выводятся.
+      properties:
+        from:
+          type: string
+          nullable: true
+          example: '2026-05-25'
+        to:
+          type: string
+          nullable: true
+          example: '2026-06-25'
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2026-08-03T04:00:00Z'
+        order:
+          type: string
+          enum: [views, questions, asc]
+          default: views
+        total_exhibits:
+          type: integer
+          default: 0
+          example: 340
+        never_viewed:
+          type: integer
+          default: 0
+          description: Экспонатов без единого просмотра за период.
+          example: 96
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalyticsExhibitRow'
+
+    # ── Аналитика: качество распознавания ──
+    AnalyticsRecognition:
+      type: object
+      description: >-
+        Успешность распознавания, частота фолбэка с топ-3 кандидатов и поведение
+        после неудачи. Считается одним проходом по событиям визита.
+      properties:
+        from:
+          type: string
+          nullable: true
+          example: '2026-05-25'
+        to:
+          type: string
+          nullable: true
+          example: '2026-06-25'
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2026-08-03T04:00:00Z'
+        total:
+          type: integer
+          default: 0
+          example: 980
+        success:
+          type: integer
+          default: 0
+          example: 843
+        success_rate:
+          type: number
+          format: float
+          default: 0
+          example: 0.86
+        fallback_shown:
+          type: integer
+          default: 0
+          description: Показов топ-3 кандидатов (props.fallback = true).
+          example: 96
+        fallback_rate:
+          type: number
+          format: float
+          default: 0
+          example: 0.098
+        fallback_converted:
+          type: integer
+          default: 0
+          description: >-
+            После фолбэка открыли карточку экспоната из кандидатов
+            (exhibit_view с props.source = recognition).
+          example: 61
+        fallback_conversion_rate:
+          type: number
+          format: float
+          default: 0
+          example: 0.635
+        failed:
+          type: integer
+          default: 0
+          example: 137
+        abandoned_after_fail:
+          type: integer
+          default: 0
+          description: >-
+            После неудачи в визите не было ни одного события, кроме session_end.
+            Повторная съёмка и открытие экспоната руками уходом не считаются.
+          example: 24
+        abandonment_rate:
+          type: number
+          format: float
+          default: 0
+          example: 0.175
+        retry_after_fail:
+          type: integer
+          default: 0
+          example: 58
+        avg_confidence:
+          type: number
+          format: float
+          default: 0
+          example: 0.81
+
+    # ── Аналитика: суточный срез и пересчёт ──
+    AnalyticsDailyPoint:
+      type: object
+      required: [date, metric]
+      properties:
+        date:
+          type: string
+          format: date
+          example: '2026-08-02'
+        metric:
+          type: string
+          example: events_by_type
+        dimension_key:
+          type: string
+          description: Разрез метрики; пусто — метрика без разреза.
+          default: ''
+          example: exhibit_view
+        dimension_id:
+          type: integer
+          nullable: true
+          example: 101
+        value:
+          type: number
+          default: 0
+          example: 187
+
+    AnalyticsDailySeries:
+      type: object
+      properties:
+        from:
+          type: string
+          nullable: true
+          example: '2026-07-01'
+        to:
+          type: string
+          nullable: true
+          example: '2026-07-31'
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          example: '2026-08-03T04:00:00Z'
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/AnalyticsDailyPoint'
+
+    AnalyticsRebuildResult:
+      type: object
+      required: [updated_at]
+      properties:
+        rebuilt_reports:
+          type: array
+          items:
+            type: string
+          example: [overview, questions, unanswered, engagement, routes, exhibits, recognition]
+        daily_days:
+          type: integer
+          default: 0
+          description: За сколько суток пересчитан плоский срез.
+          example: 2
+        daily_rows:
+          type: integer
+          default: 0
+          example: 1840
+        updated_at:
+          type: string
+          format: date-time
+          example: '2026-08-03T04:00:00Z'
 
     # ── Телеметрия ──
     Event:
@@ -3167,15 +4041,23 @@ components:
       properties:
         type:
           type: string
+          description: >-
+            Тип события из словаря контракта. `audio_play` — устаревший
+            псевдоним, бэкенд нормализует его в канонический `tts_play`.
+            Событие с типом вне словаря ОТБРАСЫВАЕТСЯ поштучно и попадает в
+            `rejected`; остальные события батча записываются.
           enum:
             - app_open
             - hall_view
             - showcase_view
             - exhibit_view
             - recognition
+            - chat_open
             - chat_message
+            - tts_play
+            - search_query
+            - session_end
             - audio_play
-            - suggestion_click
           example: exhibit_view
         exhibit_id:
           type: integer
@@ -3183,17 +4065,40 @@ components:
         hall_id:
           type: integer
           nullable: true
+        showcase_id:
+          type: integer
+          nullable: true
+          description: Витрина, с которой пришло событие (showcase_view, exhibit_view из витрины).
         label_slug:
           type: string
           nullable: true
+        device_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: >-
+            Анонимный постоянный идентификатор устройства (localStorage) — нужен
+            только для метрики повторных визитов. Если не задан на событии,
+            берётся из батча. Ни с чем персональным не связывается.
         ts:
           type: string
           format: date-time
           nullable: true
+          description: >-
+            Момент ДЕЙСТВИЯ (проставляет фронт), а не момент отправки батча.
+            Если не прислан — проставит БД.
         props:
           type: object
           nullable: true
+          description: >-
+            Специфика события. Сохраняются ТОЛЬКО ключи из контракта, остальные
+            отбрасываются на приёме (белый список, см. docs/analytics-privacy.md):
+            app_open — entry, qr_id; exhibit_view — source; recognition —
+            recognized, confidence, fallback, candidates_count; chat_message —
+            text; search_query — text, results_count; session_end — reason,
+            last_screen. `props.text` длиннее 500 символов обрезается.
           additionalProperties: true
+          example: {source: hall}
 
     EventBatch:
       type: object
@@ -3203,11 +4108,35 @@ components:
           type: string
           format: uuid
           nullable: true
+          description: Случайный UUID сессии (sessionStorage), генерируется на клиенте.
+        device_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: Значение device_id по умолчанию для всех событий батча.
         events:
           type: array
           minItems: 1
+          maxItems: 50
+          description: >-
+            Не более 50 событий за раз: эндпоинт открыт без авторизации, объём
+            записи ограничен. Батч большего размера отклоняется с 422.
           items:
             $ref: '#/components/schemas/Event'
+
+    EventIngestResult:
+      type: object
+      properties:
+        accepted:
+          type: integer
+          default: 0
+          description: Сколько событий записано.
+          example: 9
+        rejected:
+          type: integer
+          default: 0
+          description: Сколько отброшено из-за неизвестного `type`.
+          example: 1
 
     # ── Ошибки (формат FastAPI) ──
     Error:

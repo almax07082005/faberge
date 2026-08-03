@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from datetime import date
+from io import BytesIO
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Path, Query, UploadFile
+from fastapi.responses import StreamingResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,7 +15,7 @@ from .. import schemas as sch
 from ..config import settings
 from ..db import get_session
 from ..dependencies import require_admin
-from ..services import UpstreamError, llm, storage
+from ..services import UpstreamError, analytics_export, llm, storage
 
 # Логин выдаёт токен, поэтому НЕ должен сам требовать токен — отдельный роутер без require_admin.
 auth_router = APIRouter(prefix="/admin", tags=["Администрирование"])
@@ -394,22 +396,54 @@ async def delete_media(
     await storage.delete_many([url])
 
 
+
+# ── Аналитика ────────────────────────────────────────────────────────────────
+# Все отчёты отдаются из кэша агрегатов (§12): реалтайм по ТЗ не требуется,
+# данные обновляются раз в сутки ночным джобом. В каждом ответе есть
+# `updated_at` — фронт показывает «данные на 03.08.2026 04:00», чтобы отсутствие
+# сегодняшних цифр не выглядело поломкой дашборда. Промах кэша считается на лету
+# и запоминается; принудительный пересчёт — POST /admin/analytics/rebuild.
+#
+# Границы периода ВКЛЮЧАЮЩИЕ с обеих сторон: `from=2026-07-01&to=2026-07-31`
+# отдаёт и события 31 июля (до 03.08.2026 `to` работала как исключающая, и
+# последний день периода молча терялся).
+_PERIOD_DESC = (
+    "Опциональные `from`/`to` — даты включительно с обеих сторон. В ответе "
+    "`updated_at` — время пересчёта агрегатов."
+)
+
+
+def _variant(actual: dict, defaults: dict) -> str:
+    """Хвост ключа кэша: пусто для параметров по умолчанию (их и греет джоб)."""
+    if actual == defaults:
+        return ""
+    return "|".join(f"{key}={value}" for key, value in sorted(actual.items()))
+
+
 @router.get("/analytics/overview", response_model=sch.AnalyticsOverview, summary="[Вне MVP] Сводная аналитика")
 async def analytics_overview(
     from_: Optional[date] = Query(None, alias="from"),
     to: Optional[date] = Query(None),
+    limit: int = Query(5, ge=1, le=50, description="Размер топов экспонатов и залов."),
     session: AsyncSession = Depends(get_session),
 ) -> sch.AnalyticsOverview:
-    return await crud.analytics_overview(session, from_, to)
+    return await crud.cached_report(
+        session, "overview", from_, to, sch.AnalyticsOverview,
+        lambda: crud.analytics_overview(session, from_, to, limit),
+        variant=_variant({"limit": limit}, {"limit": 5}),
+    )
 
 
 @router.get(
     "/analytics/questions", response_model=sch.AnalyticsQuestions,
     summary="Аналитика: частые и редкие вопросы",
     description=(
-        "Агрегирует реплики посетителей (`guide_messages`, role=user): топ частых и "
-        "редких формулировок (нормализация trim+lower), всего/уникальных вопросов. "
-        "Опциональные `from`/`to` (даты, `to` не включительно), `limit` — размер топов."
+        "Реплики посетителей (`guide_messages`, role=user), сгруппированные ПО СМЫСЛУ: "
+        "«Сколько стоит яйцо?», «какая цена яйца» и «Сколько это стоит» попадают в один "
+        "кластер. У каждого кластера — представитель (`question`, самая частая "
+        "формулировка), `variants` (другие формулировки) и суммарный `count`.\n\n"
+        "`rare` — кластеры, встретившиеся не чаще порога `ANALYTICS_RARE_MAX_COUNT`; "
+        "с `frequent` они не пересекаются. " + _PERIOD_DESC
     ),
 )
 async def analytics_questions(
@@ -418,16 +452,51 @@ async def analytics_questions(
     limit: int = Query(20, ge=1, le=100),
     session: AsyncSession = Depends(get_session),
 ) -> sch.AnalyticsQuestions:
-    return await crud.analytics_questions(session, from_, to, limit)
+    return await crud.cached_report(
+        session, "questions", from_, to, sch.AnalyticsQuestions,
+        lambda: crud.analytics_questions(session, from_, to, limit),
+        variant=_variant({"limit": limit}, {"limit": 20}),
+    )
+
+
+@router.get(
+    "/analytics/unanswered", response_model=sch.AnalyticsUnanswered,
+    summary="Аналитика: вопросы, на которые гид не смог ответить",
+    description=(
+        "Показывает, чего не хватает в описаниях экспонатов. Признак `answered` и "
+        "причина отказа проставляются в момент генерации ответа: `no_context` — "
+        "не было справки, `llm_refusal` — модель отказалась при наличии материалов, "
+        "`not_found` — экспонат не найден в каталоге, `error` — сбой LLM.\n\n"
+        "Вопросы сгруппированы тем же кластеризатором, что и `/analytics/questions`, "
+        "и привязаны к экспонатам из контекста запроса. Сообщения, накопленные до "
+        "03.08.2026, признака не имеют и попадают в `unclassified` "
+        "(разовый бэкфилл — `scripts/backfill_unanswered.py`). " + _PERIOD_DESC
+    ),
+)
+async def analytics_unanswered(
+    from_: Optional[date] = Query(None, alias="from"),
+    to: Optional[date] = Query(None),
+    limit: int = Query(20, ge=1, le=100),
+    session: AsyncSession = Depends(get_session),
+) -> sch.AnalyticsUnanswered:
+    return await crud.cached_report(
+        session, "unanswered", from_, to, sch.AnalyticsUnanswered,
+        lambda: crud.analytics_unanswered(session, from_, to, limit),
+        variant=_variant({"limit": limit}, {"limit": 20}),
+    )
 
 
 @router.get(
     "/analytics/engagement", response_model=sch.AnalyticsEngagement,
-    summary="Аналитика: длительность сессии (первое открытие → последнее действие)",
+    summary="Аналитика: длительность визита и вовлечённость",
     description=(
-        "Время от первого события сессии до последнего (по `events`): среднее, "
-        "медиана, максимум, среднее число событий на сессию и распределение по "
-        "корзинам длительности. Опциональные `from`/`to`."
+        "Длительность считается по ВИЗИТАМ, а не по сессии целиком: поток событий "
+        "режется по неактивности дольше `SESSION_TIMEOUT_MINUTES` (30 минут), поэтому "
+        "вкладка, открытая утром и ожившая через четыре часа, даёт два визита, а не "
+        "один на четыре часа — и не зависит от того, дошёл ли `session_end`.\n\n"
+        "Кроме длительности: сколько экспонатов посмотрели и вопросов задали за визит, "
+        "и какая доля дошла до диалога с гидом. Знаменатель конверсий — визиты с "
+        "`app_open`; пока фронт его не шлёт, берутся все визиты. " + _PERIOD_DESC
     ),
 )
 async def analytics_engagement(
@@ -435,16 +504,24 @@ async def analytics_engagement(
     to: Optional[date] = Query(None),
     session: AsyncSession = Depends(get_session),
 ) -> sch.AnalyticsEngagement:
-    return await crud.analytics_engagement(session, from_, to)
+    return await crud.cached_report(
+        session, "engagement", from_, to, sch.AnalyticsEngagement,
+        lambda: crud.analytics_engagement(session, from_, to),
+    )
 
 
 @router.get(
     "/analytics/routes", response_model=sch.AnalyticsRoutes,
-    summary="Аналитика: маршрут пользователя по залам",
+    summary="Аналитика: маршрут по залам, точки выхода, повторные визиты",
     description=(
-        "Строит маршруты по залам из событий `hall_view`: посещения залов, точки "
-        "входа, переходы A→B и частые полные пути; среднее число залов на сессию. "
-        "Опциональные `from`/`to`, `limit` — размер топов."
+        "Маршруты по залам из событий `hall_view` внутри визита: посещения, точки "
+        "входа, переходы A→B, частые пути.\n\n"
+        "Точки выхода: `top_exit_halls` — последний зал визита, `top_exit_screens` — "
+        "тип последнего содержательного события (часть посетителей уходит из чата, а "
+        "не из зала).\n\n"
+        "Повторные визиты считаются по анонимному `device_id`, а не по `session_id` "
+        "(тот живёт в sessionStorage, новая вкладка = новый «человек»). Сессии без "
+        "`device_id` расчёт не ломают — считаются одиночными устройствами. " + _PERIOD_DESC
     ),
 )
 async def analytics_routes(
@@ -453,7 +530,140 @@ async def analytics_routes(
     limit: int = Query(10, ge=1, le=50),
     session: AsyncSession = Depends(get_session),
 ) -> sch.AnalyticsRoutes:
-    return await crud.analytics_routes(session, from_, to, limit)
+    return await crud.cached_report(
+        session, "routes", from_, to, sch.AnalyticsRoutes,
+        lambda: crud.analytics_routes(session, from_, to, limit),
+        variant=_variant({"limit": limit}, {"limit": 10}),
+    )
+
+
+@router.get(
+    "/analytics/exhibits", response_model=sch.AnalyticsExhibits,
+    summary="Аналитика: статистика по экспонатам",
+    description=(
+        "Просмотры, вопросы гиду, озвучки и распознавания по каждому экспонату. "
+        "Список строится от каталога (`exhibits LEFT JOIN events`), поэтому экспонат, "
+        "которого никто не открывал, присутствует в выдаче с `views: 0` — из одних "
+        "`events` такие «мёртвые» карточки не выводятся.\n\n"
+        "`order`: `views` — топ по просмотрам, `questions` — топ по вопросам к ИИ-гиду "
+        "(это не то же самое), `asc` — от наименее просматриваемых. " + _PERIOD_DESC
+    ),
+)
+async def analytics_exhibits(
+    from_: Optional[date] = Query(None, alias="from"),
+    to: Optional[date] = Query(None),
+    limit: int = Query(20, ge=1, le=500),
+    order: str = Query("views", pattern="^(views|questions|asc)$"),
+    session: AsyncSession = Depends(get_session),
+) -> sch.AnalyticsExhibits:
+    return await crud.cached_report(
+        session, "exhibits", from_, to, sch.AnalyticsExhibits,
+        lambda: crud.analytics_exhibits(session, from_, to, limit, order),
+        variant=_variant({"limit": limit, "order": order}, {"limit": 20, "order": "views"}),
+    )
+
+
+@router.get(
+    "/analytics/recognition", response_model=sch.AnalyticsRecognition,
+    summary="Аналитика: качество распознавания по фото",
+    description=(
+        "Успешность распознавания, частота фолбэка с топ-3 кандидатов и поведение "
+        "после неудачи. «Ушёл» — если после неуспешной попытки в визите не было "
+        "ни одного события, кроме `session_end`: повторная съёмка и открытие "
+        "экспоната руками уходом не считаются. Всё считается одним проходом по "
+        "событиям визита, без запроса на каждое событие. " + _PERIOD_DESC
+    ),
+)
+async def analytics_recognition(
+    from_: Optional[date] = Query(None, alias="from"),
+    to: Optional[date] = Query(None),
+    session: AsyncSession = Depends(get_session),
+) -> sch.AnalyticsRecognition:
+    return await crud.cached_report(
+        session, "recognition", from_, to, sch.AnalyticsRecognition,
+        lambda: crud.analytics_recognition(session, from_, to),
+    )
+
+
+@router.get(
+    "/analytics/daily", response_model=sch.AnalyticsDailySeries,
+    summary="Аналитика: суточный срез агрегатов",
+    description=(
+        "Плоский временной ряд из таблицы `analytics_daily`, которую заполняет ночной "
+        "джоб: `events_total`, `events_by_type`, `sessions`, `exhibit_views`, "
+        "`hall_views`, `recognition_success`, `chat_messages`, "
+        "`chat_messages_unanswered`. `dimension_key` — разрез метрики (тип события, id "
+        "экспоната/зала); пусто — метрика без разреза. Пока джоб не отработал, ряд пуст: "
+        "запустите `POST /admin/analytics/rebuild`."
+    ),
+)
+async def analytics_daily(
+    from_: Optional[date] = Query(None, alias="from"),
+    to: Optional[date] = Query(None),
+    metric: Optional[str] = Query(None, description="Фильтр по имени метрики."),
+    session: AsyncSession = Depends(get_session),
+) -> sch.AnalyticsDailySeries:
+    return await crud.analytics_daily_series(session, from_, to, metric)
+
+
+@router.post(
+    "/analytics/rebuild", response_model=sch.AnalyticsRebuildResult,
+    summary="Аналитика: пересчитать агрегаты вручную",
+    description=(
+        "Пересчитывает суточный срез и прогревает кэш всех отчётов за период — чтобы "
+        "не ждать ночного джоба при отладке и демонстрации. Идемпотентно: повторный "
+        "запуск за ту же дату перезаписывает строки, а не удваивает цифры.\n\n"
+        "То же самое из cron: `python scripts/rebuild_analytics.py`."
+    ),
+)
+async def analytics_rebuild(
+    from_: Optional[date] = Query(None, alias="from"),
+    to: Optional[date] = Query(None),
+    session: AsyncSession = Depends(get_session),
+) -> sch.AnalyticsRebuildResult:
+    return await crud.rebuild_analytics(session, from_, to)
+
+
+@router.get(
+    "/analytics/export",
+    summary="Аналитика: выгрузка отчёта в .xlsx / .pdf",
+    description=(
+        "Отдаёт отчёт файлом за тем же Bearer, что и остальная админка. "
+        "`.xlsx` — один лист на отчёт, числа числами (музей сводит их в Excel "
+        "формулами). `.pdf` — таблицы с шапкой периода и датой формирования; "
+        "кириллица требует TTF-шрифта (`ANALYTICS_PDF_FONT_PATH` либо "
+        "`assets/fonts/DejaVuSans.ttf`), иначе выгрузка вернёт 503, а не лист с "
+        "квадратами. Имя файла — `faberge-<report>-<from>-<to>.<ext>`."
+    ),
+    responses={200: {"content": {
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {},
+        "application/pdf": {},
+    }, "description": "Файл отчёта."}},
+)
+async def export_analytics(
+    report: str = Query(..., pattern="^(overview|questions|unanswered|exhibits|routes|recognition)$"),
+    format: str = Query("xlsx", pattern="^(xlsx|pdf)$"),
+    from_: Optional[date] = Query(None, alias="from"),
+    to: Optional[date] = Query(None),
+    session: AsyncSession = Depends(get_session),
+) -> StreamingResponse:
+    payload = (await crud.build_report(session, report, from_, to)).model_dump(mode="json", by_alias=True)
+    try:
+        if format == "pdf":
+            data = analytics_export.to_pdf(report, payload)
+            media_type = "application/pdf"
+        else:
+            data = analytics_export.to_xlsx(report, payload)
+            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    except analytics_export.ExportError as exc:
+        raise HTTPException(status_code=503, detail=exc.message)
+
+    name = analytics_export.file_name(report, from_, to, format)
+    return StreamingResponse(
+        BytesIO(data),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
 
 
 async def _exhibit_exists(session: AsyncSession, exhibit_id: int) -> bool:

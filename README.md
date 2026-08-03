@@ -128,8 +128,13 @@ scripts/
   init_db.py            Применить схему/сид к локальной или Managed PG
   cleanup_hall_catalog.py       Чистка каталога залов (лестница / № 99 / № 100)
   import_guide_showcases.py     Импорт витрин и экспонатов по путеводителю
+  rebuild_analytics.py          Ночной пересчёт аналитических агрегатов (cron)
+  backfill_unanswered.py        Разовая разметка «гид не ответил» по старым диалогам
   smoke_backend_tasks.py        Интеграционный smoke бэкенд-трекера (B1–B11)
   smoke_bugreport_20260728.py   Интеграционный smoke по баг-репорту 28.07.2026
+  smoke_analytics_20260803.py   Интеграционный smoke аналитики посетителей
+docs/
+  analytics-privacy.md  Состав данных аналитики: что храним, зачем, как обезличено
 tests/                  Юнит-тесты чистых функций (запускаются без БД и сети)
 Dockerfile, docker-compose.yml, .env.example
 ```
@@ -140,12 +145,16 @@ Dockerfile, docker-compose.yml, .env.example
 python tests/test_guide_intel.py        # разбор намерения реплики гида (B7/B9/B10, C25)
 python tests/test_text_normalize.py     # числительные для озвучки («Пётр Первый»)
 python tests/test_recognizer_match.py   # сшивка названий ML-индекса с каталогом
+python tests/test_question_cluster.py   # смысловая группировка вопросов посетителей
+python tests/test_visits.py             # разбиение сессии на визиты по таймауту 30 мин
+python tests/test_event_contract.py     # словарь типов событий и белый список props
 # либо все сразу, если установлен pytest:
 python -m pytest tests/
 
 # интеграционные (нужен запущенный API с применённой схемой + seed):
 BASE_URL=http://localhost:8000 python scripts/smoke_backend_tasks.py
 BASE_URL=http://localhost:8000 python scripts/smoke_bugreport_20260728.py
+BASE_URL=http://localhost:8000 python scripts/smoke_analytics_20260803.py   # аналитика посетителей
 ```
 
 ## Карта эндпоинтов
@@ -161,7 +170,8 @@ BASE_URL=http://localhost:8000 python scripts/smoke_bugreport_20260728.py
 | Озвучивание | `POST /speech` (SpeechKit) |
 | Админ · вход | `POST /admin/login` (логин/пароль → Bearer-токен; открытый) |
 | Админ · медиа | `GET`/`POST /admin/exhibits/{id}/media`, `DELETE /admin/exhibits/{id}/media/{image_id}`, `POST /admin/halls/{id}/cover` |
-| Администрирование* | CRUD `/admin/exhibits`, `/admin/halls`, `PATCH /admin/halls/{id}`, `/admin/showcases`, `PATCH /admin/showcases/{id}`, `/admin/analytics/overview` |
+| Администрирование* | CRUD `/admin/exhibits`, `/admin/halls`, `PATCH /admin/halls/{id}`, `/admin/showcases`, `PATCH /admin/showcases/{id}` |
+| Админ · аналитика* | `GET /admin/analytics/{overview,questions,unanswered,engagement,routes,exhibits,recognition,daily}`, `GET /admin/analytics/export`, `POST /admin/analytics/rebuild` |
 | Телеметрия | `POST /telemetry/events` (обязательный контракт с 21.07.2026 — источник аналитики) |
 
 \* — вне MVP; защищено `bearerAuth` (заголовок `Authorization: Bearer <token>`, токен — из `POST /admin/login` или `ADMIN_API_TOKEN`). Загрузка медиа/обложек и вход — рабочие (в MVP): размер ≤ `MAX_UPLOAD_MB` (10 МБ), форматы JPEG/PNG/WebP; `thumbnail_url` совпадает с `image_url` (отдельная миниатюра не генерируется).
@@ -180,7 +190,7 @@ BASE_URL=http://localhost:8000 python scripts/smoke_bugreport_20260728.py
 файла. Применяются до деплоя новой версии кода:
 
 ```bash
-psql "$DATABASE_URL" -f db/migrations/2026-07-29_bugreport_catalog.sql
+psql "$DATABASE_URL" -f db/migrations/2026-08-03_analytics.sql
 # либо (тот же эффект) переприменить схему целиком:
 python scripts/init_db.py
 ```
@@ -204,6 +214,31 @@ BASE_URL=... ADMIN_TOKEN=... \
 
 Группировку «витрина → её экспонаты» фронт собирает из одного ответа
 `GET /halls/{id}/exhibits`: каждый элемент несёт `showcase_id` и `showcase_number`.
+
+### Аналитика посетителей
+
+Источник — таблица `events` (телеметрия с фронта) и `guide_messages` (диалоги).
+События по требованию заказчика **не удаляются**, поэтому таблица растёт линейно
+от посещаемости — отсюда индексы в миграции `2026-08-03_analytics.sql` и ночной
+пересчёт агрегатов.
+
+| Что | Как устроено |
+|---|---|
+| Контракт событий | Закрытый словарь типов (`schemas.EventType`). Неизвестный тип не роняет батч: отбрасывается поштучно, число — в `rejected`. `audio_play` нормализуется в `tts_play`. |
+| Приватность | `props` принимается по белому списку ключей; IP и User-Agent не читаются и не логируются. Подробно — [`docs/analytics-privacy.md`](docs/analytics-privacy.md). |
+| Границы периода | `from`/`to` — **включительно с обеих сторон**: `to=2026-07-31` отдаёт и события 31 июля. |
+| Визиты | Поток событий сессии режется по неактивности дольше `SESSION_TIMEOUT_MINUTES` (30 мин): вкладка, ожившая через четыре часа, даёт два визита, а не один на четыре часа. |
+| Вопросы | Группируются по смыслу (`services/question_cluster.py`), а не по точному совпадению строки: «Сколько стоит яйцо?» и «какая цена яйца» — один кластер. |
+| Вопросы без ответа | Признак `guide_messages.answered` + причина проставляются в момент генерации ответа. Старые диалоги размечает `scripts/backfill_unanswered.py`. |
+| Агрегаты | Отчёты отдаются из кэша (`analytics_reports`), суточный срез — в `analytics_daily`; в каждом ответе есть `updated_at`. |
+| Выгрузка | `GET /admin/analytics/export?report=…&format=xlsx|pdf`. Для кириллицы в PDF нужен TTF: `ANALYTICS_PDF_FONT_PATH` либо `assets/fonts/DejaVuSans.ttf`. |
+
+```bash
+# ночной пересчёт (cron: 0 4 * * *)
+python scripts/rebuild_analytics.py --days 2
+# разовая разметка накопленных диалогов
+python scripts/backfill_unanswered.py --apply
+```
 
 ### Контекст диалога ИИ-гида
 

@@ -150,6 +150,46 @@ async def generate_story(req: sch.StoryRequest, session: AsyncSession = Depends(
     )
 
 
+def _add_messages(
+    session: AsyncSession,
+    sess: m.GuideSession,
+    question: str,
+    answer: str,
+    context: Optional[sch.GuideContext],
+    answered: bool,
+    fail_reason: Optional[str],
+) -> None:
+    """Положить в сессию пару «вопрос — ответ» с признаком ответа (§4).
+
+    Признак и контекст пишутся на ОБЕ строки: отчёт `/admin/analytics/unanswered`
+    читает реплики посетителя (`role='user'`) и не должен ради этого джойнить
+    таблицу саму с собой.
+    """
+    common = dict(
+        answered=answered,
+        fail_reason=fail_reason,
+        exhibit_id=context.exhibit_id if context else None,
+        hall_id=context.hall_id if context else None,
+    )
+    session.add(m.GuideMessage(session_id=sess.id, role="user", content=question, **common))
+    session.add(m.GuideMessage(session_id=sess.id, role="assistant", content=answer, **common))
+
+
+async def _persist_messages(
+    session: AsyncSession,
+    sess: m.GuideSession,
+    question: str,
+    answer: str,
+    context: Optional[sch.GuideContext],
+    answered: bool,
+    fail_reason: Optional[str],
+) -> None:
+    """То же, но с немедленной фиксацией — для ветки, которая дальше бросает 502."""
+    _add_messages(session, sess, question, answer, context, answered, fail_reason)
+    sess.last_activity = datetime.now(timezone.utc)
+    await session.commit()
+
+
 def _is_blank_context(context: Optional[sch.GuideContext]) -> bool:
     """Пустой контекст: `null` или объект, у которого не заполнено ни одно поле (`{}`)."""
     return context is None or all(v is None for v in context.model_dump().values())
@@ -234,6 +274,13 @@ async def chat(req: sch.ChatRequest, session: AsyncSession = Depends(get_session
     location: Optional[sch.GuideLocation] = None
     questions: List[str] = []
 
+    # §4 — «смог ли гид ответить». Признак ставится ЗДЕСЬ, в момент генерации:
+    # постфактум отличить содержательный ответ от вежливого отказа («не могу
+    # предоставить полный список») по тексту в БД невозможно. По умолчанию ответ
+    # считается содержательным — детерминированные ветки ниже его не меняют.
+    answered = True
+    fail_reason: Optional[str] = None
+
     # B9 — поиск по номеру. Реплика-номер неоднозначна (это может быть год «1885»
     # или количество), поэтому ветку берём ТОЛЬКО при реальном совпадении по номеру;
     # иначе (0 совпадений) проваливаемся в обычный диалог, а не в тупик «не нашёл».
@@ -270,6 +317,12 @@ async def chat(req: sch.ChatRequest, session: AsyncSession = Depends(get_session
                 grounding, history, req.message, req.language, req.max_questions, exhibit_dict
             )
         except UpstreamError as exc:
+            # Сбой LLM — тоже «вопрос без ответа»: записываем реплику с причиной
+            # `error` до того, как отдать 502, иначе такие вопросы не попадут ни
+            # в один отчёт и провал останется невидимым.
+            await _persist_messages(
+                session, sess, req.message, exc.message, context, answered=False, fail_reason="error"
+            )
             raise HTTPException(status_code=502, detail=exc.message)
         # B6 — экспонаты, о которых речь: retrieval по вопросу + ответу.
         found = await crud.search_exhibits_orm(session, f"{req.message} {answer}", limit=4)
@@ -281,9 +334,16 @@ async def chat(req: sch.ChatRequest, session: AsyncSession = Depends(get_session
                 location = crud.to_location(target)
                 if not referenced_exhibits:
                     referenced_exhibits = [crud.to_referenced_exhibit(target)]
+            else:
+                # Спросили «где найти», а экспонат в каталоге не нашёлся.
+                answered, fail_reason = False, "not_found"
+        if answered and guide_intel.is_refusal(answer):
+            # Отказ без справки — не хватило контекста; со справкой — модель
+            # отказалась при наличии материалов.
+            answered = False
+            fail_reason = "no_context" if not grounding.strip() else "llm_refusal"
 
-    session.add(m.GuideMessage(session_id=sess.id, role="user", content=req.message))
-    session.add(m.GuideMessage(session_id=sess.id, role="assistant", content=answer))
+    _add_messages(session, sess, req.message, answer, context, answered, fail_reason)
     sess.last_activity = datetime.now(timezone.utc)
     if context is not None:
         sess.context = context.model_dump()

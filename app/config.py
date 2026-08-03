@@ -42,6 +42,23 @@ class Settings(BaseSettings):
     # нормализацию (app/services/text_normalize.py) — дешевле, но грубее.
     tts_spoken_via_llm: bool = True
 
+    # ── Аналитика посетителей ────────────────────────────────────────────────
+    # Неактивность, после которой визит считается завершённым (требование
+    # заказчика — 30 минут). Используется и при приёме `session_end` от фронта,
+    # и как серверная страховка: поток событий сессии режется по разрыву,
+    # даже если `session_end` не дошёл (app/services/visits.py).
+    session_timeout_minutes: int = 30
+    # Отчёты отдаются из кэша агрегатов (таблица analytics_reports); запись
+    # старше этого срока пересчитывается на лету. По ТЗ реалтайм не требуется —
+    # данные обновляются раз в сутки ночным джобом (scripts/rebuild_analytics.py).
+    analytics_cache_ttl_minutes: int = 1440
+    # Кластер вопросов с частотой не выше этого числа попадает в «редкие».
+    analytics_rare_max_count: int = 2
+    # Шрифт с кириллицей для PDF-выгрузки. Пусто — ищем по стандартным путям
+    # системы (app/services/analytics_export.py). Без кириллического шрифта
+    # ReportLab выдаёт лист с квадратами вместо текста.
+    analytics_pdf_font_path: Optional[str] = None
+
     # ── Yandex Cloud (опционально; без ключей сервисы работают в режиме-стабе) ─
     yandex_api_key: Optional[str] = None
     yandex_folder_id: Optional[str] = None

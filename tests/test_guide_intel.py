@@ -14,6 +14,22 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from app.services import guide_intel as gi
 
 
+def test_is_refusal_positive():
+    """§4: отказ гида распознаётся по фразам-маркерам (для отчёта «вопросы без ответа»)."""
+    assert gi.is_refusal("Не могу предоставить полный список экспонатов.")
+    assert gi.is_refusal("К сожалению, у меня нет информации об этом предмете.")
+    assert gi.is_refusal("В предоставленных материалах нет ответа на ваш вопрос.")
+    assert gi.is_refusal("Не нашёл такой экспонат.")
+    assert gi.is_refusal("Не нашел такой экспонат.")  # без «ё»
+    assert gi.is_refusal("Уточните, что именно вас интересует.")
+
+
+def test_is_refusal_negative():
+    assert not gi.is_refusal("Яйцо «Коронационное» создано в 1897 году мастером Перхиным.")
+    assert not gi.is_refusal("Оно находится в зале 3, витрина 2.")
+    assert not gi.is_refusal("")
+
+
 def test_parse_exhibit_number_positive():
     assert gi.parse_exhibit_number("12") == "12"
     assert gi.parse_exhibit_number("№ 12") == "12"

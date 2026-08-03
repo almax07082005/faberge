@@ -10,3 +10,8 @@ python-multipart>=0.0.9
 httpx>=0.27
 PyYAML>=6.0
 boto3>=1.34
+# Выгрузка аналитических отчётов (§11 ТЗ 03.08.2026): .xlsx и .pdf.
+# Импортируются лениво (app/services/analytics_export.py) — на холодный старт и
+# остальной API не влияют.
+openpyxl>=3.1
+reportlab>=4.0

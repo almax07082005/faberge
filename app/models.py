@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Optional
 
 from sqlalchemy import (
@@ -10,6 +10,8 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     Computed,
+    Date,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -159,7 +161,13 @@ class GuideSession(Base):
 
 class GuideMessage(Base):
     __tablename__ = "guide_messages"
-    __table_args__ = (CheckConstraint("role IN ('user','assistant','system')", name="guide_messages_role_chk"),)
+    __table_args__ = (
+        CheckConstraint("role IN ('user','assistant','system')", name="guide_messages_role_chk"),
+        CheckConstraint(
+            "fail_reason IS NULL OR fail_reason IN ('no_context','llm_refusal','not_found','error')",
+            name="guide_messages_fail_reason_chk",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     session_id: Mapped[uuid.UUID] = mapped_column(
@@ -167,12 +175,25 @@ class GuideMessage(Base):
     )
     role: Mapped[str] = mapped_column(String(16), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Смог ли гид ответить (§4 ТЗ 03.08.2026). Проставляется в момент генерации
+    # ответа в app/routers/guide.py — постфактум отличить содержательный ответ от
+    # отказа невозможно. NULL = признак не проставлен (сообщения до миграции
+    # 2026-08-03; бэкфилл — scripts/backfill_unanswered.py).
+    # Пишется на ОБЕ строки пары (вопрос и ответ): отчёт «вопросы без ответа»
+    # читает role='user' без self-join.
+    answered: Mapped[Optional[bool]] = mapped_column(Boolean)
+    fail_reason: Mapped[Optional[str]] = mapped_column(String(32))
+    # Контекст вопроса — у какого экспоната/зала спрашивали (для привязки отчёта).
+    exhibit_id: Mapped[Optional[int]] = mapped_column(Integer)
+    hall_id: Mapped[Optional[int]] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     session: Mapped["GuideSession"] = relationship(back_populates="messages")
 
 
 class Event(Base):
+    """Событие телеметрии. Персональных данных не содержит (docs/analytics-privacy.md)."""
+
     __tablename__ = "events"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -180,6 +201,47 @@ class Event(Base):
     type: Mapped[str] = mapped_column(String(32), nullable=False)
     exhibit_id: Mapped[Optional[int]] = mapped_column(Integer)
     hall_id: Mapped[Optional[int]] = mapped_column(Integer)
+    showcase_id: Mapped[Optional[int]] = mapped_column(Integer)
     label_slug: Mapped[Optional[str]] = mapped_column(String(100))
+    # Анонимный постоянный ID устройства (localStorage на фронте) — только для
+    # метрики повторных визитов (§7): session_id живёт в sessionStorage, поэтому
+    # новая вкладка = новый «человек». Ни с чем персональным не связывается.
+    device_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True))
     props: Mapped[Optional[dict]] = mapped_column(JSONB)
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AnalyticsDaily(Base):
+    """Плоский суточный срез агрегатов (§12).
+
+    ``dimension_key`` = '' — метрика без разреза (NULL в составном PK недопустим).
+    Джоб пересчёта идемпотентен: повторный запуск за дату перезаписывает строки.
+    """
+
+    __tablename__ = "analytics_daily"
+
+    date: Mapped[date] = mapped_column(Date, primary_key=True)
+    metric: Mapped[str] = mapped_column(String(64), primary_key=True)
+    dimension_key: Mapped[str] = mapped_column(String(128), primary_key=True, default="")
+    dimension_id: Mapped[Optional[int]] = mapped_column(Integer)
+    value: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AnalyticsReport(Base):
+    """Кэш готового отчёта за период (§12).
+
+    Отчёты с кластеризацией вопросов и разбором последовательностей событий в
+    плоскую суточную схему не ложатся — ТЗ прямо разрешает под них отдельное
+    хранилище. ``period_key`` = '<from>:<to>' с пустыми частями для открытых
+    границ ('2026-07-01:2026-07-31', ':2026-07-31', ':').
+    """
+
+    __tablename__ = "analytics_reports"
+
+    report: Mapped[str] = mapped_column(String(32), primary_key=True)
+    period_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    period_from: Mapped[Optional[date]] = mapped_column(Date)
+    period_to: Mapped[Optional[date]] = mapped_column(Date)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
