@@ -74,6 +74,23 @@ def test_recognition_props_kept():
     assert props == {"recognized": True, "confidence": 0.91, "fallback": False, "candidates_count": 3}
 
 
+def test_recognition_retry_kept():
+    """ТЗ 04.08.2026 §1: повторная съёмка после неудачи доезжает до БД."""
+    props = sch.normalize_event(
+        sch.Event(type="recognition", props={"recognized": False, "retry": True})
+    ).props
+    assert props == {"recognized": False, "retry": True}
+
+
+def test_recognition_retry_does_not_open_the_whitelist():
+    """`retry` разрешён только у recognition, прочие ключи по-прежнему отбрасываются."""
+    props = sch.normalize_event(
+        sch.Event(type="recognition", props={"retry": True, "attempt": 2, "user_agent": "curl"})
+    ).props
+    assert props == {"retry": True}
+    assert sch.normalize_event(sch.Event(type="hall_view", props={"retry": True})).props is None
+
+
 def test_batch_size_limit():
     ok = sch.EventBatch(events=[sch.Event(type="hall_view")] * sch.MAX_EVENTS_PER_BATCH)
     assert len(ok.events) == sch.MAX_EVENTS_PER_BATCH
