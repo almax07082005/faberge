@@ -1426,6 +1426,13 @@ async def analytics_recognition(
     confidences: List[float] = []
 
     for _session_id, events in visits.visits_by_session(rows):
+        # Повторную съёмку после неудачи фронт помечает `props.retry` (контракт
+        # от 04.08.2026) — он точно знает, чем кончилась предыдущая попытка.
+        # У визитов, записанных до правки, пометки нет: там считаем по-старому,
+        # эвристикой «за неудачей в том же визите пошла ещё одна попытка».
+        explicit_retry = any(
+            e.type == "recognition" and "retry" in (e.props or {}) for e in events
+        )
         for index, event in enumerate(events):
             if event.type != "recognition":
                 continue
@@ -1437,6 +1444,8 @@ async def analytics_recognition(
             fallback = _prop_bool(event.props, "fallback")
             if recognized:
                 success += 1
+            if explicit_retry and _prop_bool(event.props, "retry"):
+                retried += 1
 
             # Хвост визита до следующей попытки распознавания.
             tail: List = []
@@ -1458,7 +1467,8 @@ async def analytics_recognition(
 
             if not recognized:
                 if next_recognition:
-                    retried += 1
+                    if not explicit_retry:
+                        retried += 1
                 # «Ушёл» — после неудачи в визите не было ничего, кроме session_end.
                 # Повторная съёмка и открытие экспоната руками уходом не считаются.
                 elif not [e for e in tail if e.type != "session_end"]:

@@ -68,7 +68,14 @@ def handler(event: dict, context) -> dict:
         if not sent:
             sent = True
             return {"type": "http.request", "body": body, "more_body": False}
-        return {"type": "http.disconnect"}
+        # Тело запроса уже отдано целиком, второй раз receive() зовёт только
+        # StreamingResponse — из listen_for_disconnect. Ответить здесь
+        # http.disconnect значит сказать «клиент отвалился»: Starlette снимает
+        # задачу, которая ещё не успела отправить тело, и выгрузка
+        # /admin/analytics/export приезжала как 200 с пустым файлом (заголовки
+        # уже ушли, статус не поправить). Событие никогда не наступает —
+        # задачу-группу снимет сам StreamingResponse, когда допишет тело.
+        await asyncio.Event().wait()
 
     async def send(message):
         if message["type"] == "http.response.start":

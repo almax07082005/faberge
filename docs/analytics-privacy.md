@@ -44,7 +44,7 @@ join-ом с чем-либо ещё.
 |---|---|
 | `app_open` | `entry`, `qr_id` |
 | `exhibit_view` | `source` |
-| `recognition` | `recognized`, `confidence`, `fallback`, `candidates_count` |
+| `recognition` | `recognized`, `confidence`, `fallback`, `candidates_count`, `retry` |
 | `chat_message` | `text` |
 | `search_query` | `text`, `results_count` |
 | `session_end` | `reason`, `last_screen` |
@@ -56,6 +56,12 @@ join-ом с чем-либо ещё.
 его отсутствия.
 
 `props.text` (текст вопроса или поискового запроса) обрезается до 500 символов.
+
+`recognition.retry` (добавлен 04.08.2026) — флаг «это повторная съёмка после
+неудачной попытки», `true`/`false`. Персональных данных не добавляет: он говорит
+о предыдущем событии того же визита, а не о посетителе. Нужен затем, чтобы
+`retry_after_fail` в отчёте считался по явному признаку от клиента, а не
+восстанавливался эвристикой по порядку событий.
 
 ### Тексты вопросов
 

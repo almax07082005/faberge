@@ -4289,9 +4289,11 @@ components:
             Специфика события. Сохраняются ТОЛЬКО ключи из контракта, остальные
             отбрасываются на приёме (белый список, см. docs/analytics-privacy.md):
             app_open — entry, qr_id; exhibit_view — source; recognition —
-            recognized, confidence, fallback, candidates_count; chat_message —
-            text; search_query — text, results_count; session_end — reason,
-            last_screen. `props.text` длиннее 500 символов обрезается.
+            recognized, confidence, fallback, candidates_count, retry;
+            chat_message — text; search_query — text, results_count;
+            session_end — reason, last_screen. `props.text` длиннее 500 символов
+            обрезается. `recognition.retry` — повторная съёмка после неудачной
+            попытки; по нему считается `retry_after_fail` в отчёте.
           additionalProperties: true
           example: {source: hall}
 

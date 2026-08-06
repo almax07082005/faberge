@@ -745,7 +745,9 @@ EVENT_PROPS_ALLOWED: Dict[EventType, frozenset] = {
     EventType.hall_view: frozenset(),
     EventType.showcase_view: frozenset(),
     EventType.exhibit_view: frozenset({"source"}),
-    EventType.recognition: frozenset({"recognized", "confidence", "fallback", "candidates_count"}),
+    # `retry` — повторная съёмка после неудачной попытки; фронт знает это точно,
+    # бэкенд иначе восстанавливает признак эвристикой по порядку событий.
+    EventType.recognition: frozenset({"recognized", "confidence", "fallback", "candidates_count", "retry"}),
     EventType.chat_open: frozenset(),
     EventType.chat_message: frozenset({"text"}),
     EventType.tts_play: frozenset(),
