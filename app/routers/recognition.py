@@ -21,20 +21,47 @@ logger = logging.getLogger(__name__)
 _ALLOWED = {"image/jpeg", "image/png", "image/webp"}
 
 
+def _too_large_detail(size: int) -> str:
+    """Текст 413 для посетителя (п.10 баг-репорта 06.08.2026).
+
+    Лимит подставляем ФАКТИЧЕСКИЙ (settings.max_upload_label), а не «10 МБ из
+    конфига»: до 06.08 приложение обещало 10 МБ, а API Gateway резал запрос на
+    3.5 МиБ и отвечал без CORS-заголовков — в браузере это «Failed to fetch».
+    Пока наш лимит ниже платформенного, посетитель вместо этого получает вот эту
+    фразу — с размером своего файла, чтобы было понятно, насколько он мимо.
+    """
+    actual = f"{size / 1024 / 1024:.1f}".replace(".", ",")
+    return (
+        f"Фото слишком большое — {actual} МБ при допустимых {settings.max_upload_label}. "
+        "Сожмите изображение или снимите кадр с меньшим разрешением."
+    )
+
+
 @router.post("/recognition", response_model=sch.RecognitionResponse, summary="Распознать экспонат по фото")
 async def recognize_exhibit(
-    file: UploadFile = File(..., description="Фото экспоната (JPEG/PNG/WebP)."),
+    # П.10: лимит в описании поля — из settings.max_upload_label, а не константой в
+    # тексте. DoD «заявленный лимит совпадает с фактическим» касается и /openapi.json:
+    # раньше схема обещала 10 МБ, которых платформа не даёт.
+    file: UploadFile = File(
+        ...,
+        description=f"Фото экспоната (JPEG/PNG/WebP), не больше {settings.max_upload_label}.",
+    ),
     hall_id: Optional[int] = Form(None),
     top_k: int = Form(3, ge=1, le=10),
     session: AsyncSession = Depends(get_session),
 ) -> sch.RecognitionResponse:
     if file.content_type not in _ALLOWED:
         raise HTTPException(status_code=415, detail="Поддерживаются только JPEG, PNG и WebP.")
+    # П.10: отсекаем по размеру ДО чтения тела в память и до походов в БД/ML.
+    # Starlette проставляет size при разборе multipart, так что лишний мегабайт
+    # даже не копируется; len(data) ниже — страховка на случай size=None.
+    if file.size is not None and file.size > settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail=_too_large_detail(file.size))
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Пустой файл изображения.")
-    if len(data) > settings.max_upload_mb * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"Размер файла превышает {settings.max_upload_mb} МБ.")
+    if len(data) > settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail=_too_large_detail(len(data)))
 
     known = await crud.all_label_slugs(session)
     # Реальный ML-сервис возвращает названия (title); карта имя→slug нужна только

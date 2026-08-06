@@ -4,7 +4,7 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -531,16 +531,66 @@ class AnalyticsEngagement(BaseModel):
     # §6 — что именно посетитель успел сделать за визит.
     avg_exhibits_per_session: float = 0.0   # уникальных exhibit_view
     avg_questions_per_session: float = 0.0  # chat_message
-    sessions_with_chat: int = 0             # визитов хотя бы с одним chat_open
-    sessions_with_questions: int = 0        # визитов хотя бы с одним chat_message
-    # Знаменатель конверсий — визиты с app_open. Если app_open не приходил ни разу
-    # (фронт ещё не шлёт), знаменателем становится общее число визитов.
-    sessions_with_app_open: int = 0
-    chat_conversion_rate: float = 0.0
-    question_conversion_rate: float = 0.0
+    sessions_with_chat: int = 0             # визитов хотя бы с одним chat_open — ВСЕГО за период
+    sessions_with_questions: int = 0        # визитов хотя бы с одним chat_message — ВСЕГО за период
+    sessions_with_app_open: int = 0         # визитов с app_open (фронт шлёт с 04.08.2026)
+    # ── База конверсий (п.7 баг-репорта 06.08.2026) ──────────────────────────
+    # Знаменатель — визиты с `app_open`; если за период он не приходил ни разу
+    # (данные до 04.08.2026), базой становятся все визиты. Раньше знаменатель уже
+    # переключался на app_open, а числители оставались «по всем визитам», из-за
+    # чего доля могла превысить 100%. Теперь числитель считается ВНУТРИ базы,
+    # а сама база отдаётся явно — иначе цифру нельзя ни проверить, ни сравнить.
+    #
+    # ВНИМАНИЕ при сравнении периодов: доли, посчитанные от разных баз (до и
+    # после 04.08.2026), несопоставимы — сравнивать можно только при одинаковом
+    # `conversion_basis`.
+    conversion_basis: Literal["app_open", "all_visits"] = "all_visits"
+    conversion_denominator: int = 0         # ровно то число, на которое делили
+    # Числители, согласованные с базой: подмножество sessions_with_chat /
+    # sessions_with_questions, попавшее в знаменатель. Отдаются, чтобы дашборд
+    # не пересчитывал долю сам от «всего» и не получал те же >100%.
+    chat_conversion_numerator: int = 0
+    question_conversion_numerator: int = 0
+    chat_conversion_rate: float = 0.0       # chat_conversion_numerator / conversion_denominator
+    question_conversion_rate: float = 0.0   # question_conversion_numerator / conversion_denominator
     buckets: List[AnalyticsDurationBucket] = Field(default_factory=list)
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _restore_legacy_basis(cls, data: Any) -> Any:
+        """Достроить базу конверсий для отчётов, посчитанных до 06.08.2026.
+
+        Отчёты лежат в кэше агрегатов до ANALYTICS_CACHE_TTL_MINUTES (сутки),
+        поэтому сразу после выката ручка ещё отдаёт payload старого формата, где
+        полей базы нет, — а знаменатель 0 рядом с готовой долей выглядел бы
+        поломкой дашборда.
+
+        Восстанавливаем НЕ прежнюю формулу, а самосогласованную картину. В старых
+        записях числители посчитаны по ВСЕМ визитам — значит, и база у них все
+        визиты. Прежнее правило делило их на визиты с `app_open`, отчего доля
+        могла перевалить за 100% (ровно тот вопрос заказчика про знаменатель);
+        поэтому доля здесь пересчитывается от `total_visits`, а сохранённое в
+        кэше значение игнорируется — оно и было неверным. Отдавать сутки после
+        выката «конверсию 120%» нельзя: заказчик увидит её раньше, чем ночной
+        джоб перетрёт кэш. Точные цифры вернёт первый пересчёт —
+        `POST /admin/analytics/rebuild` либо ночной джоб.
+        """
+        if isinstance(data, dict) and "conversion_denominator" not in data:
+            visits = data.get("total_visits") or 0
+            chat = data.get("sessions_with_chat") or 0
+            questions = data.get("sessions_with_questions") or 0
+            data = {
+                **data,
+                "conversion_basis": "all_visits",
+                "conversion_denominator": visits,
+                "chat_conversion_numerator": chat,
+                "question_conversion_numerator": questions,
+                "chat_conversion_rate": round(chat / visits, 4) if visits else 0.0,
+                "question_conversion_rate": round(questions / visits, 4) if visits else 0.0,
+            }
+        return data
 
 
 # ── Аналитика: маршрут пользователя по залам (C18) ───────────────────────────

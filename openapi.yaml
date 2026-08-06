@@ -170,6 +170,14 @@ paths:
         Проверка живости сервиса и доступности внешних зависимостей
         (PostgreSQL, Object Storage, YOLO, YandexGPT, SpeechKit).
         Используется API Gateway и системой мониторинга.
+
+
+        С 06.08.2026 в `dependencies` есть ключ `pdf_font` — лежит ли в сборке
+        пригодный TTF с кириллицей для PDF-выгрузки аналитики (п. 3 баг-репорта
+        06.08.2026). `down` означает, что
+        `GET /admin/analytics/export?format=pdf` ответит 503: нехватка шрифта
+        видна сразу после деплоя, а не после жалобы заказчика на кнопку. На
+        `status` ключ не влияет — без шрифта сервис остаётся `ok`.
       operationId: getHealth
       security: []
       responses:
@@ -564,6 +572,21 @@ paths:
 
         Если уверенность ниже порога — `recognized = false`; в `candidates`
         могут вернуться наиболее вероятные классы для уточнения.
+
+        **Лимит на файл — 2,5 МБ** (`MAX_UPLOAD_MB`), превышение даёт 413 с
+        текстом «Фото слишком большое — X МБ при допустимых 2,5 МБ». Он
+        намеренно ниже платформенной границы Yandex API Gateway — **3,5 МиБ
+        (3 670 016 байт) на весь запрос**, столько же на payload синхронного
+        вызова Cloud Functions, куда тело уезжает в base64 (+33 %). Это не наш
+        выбор и кодом не поднимается — только конфигурацией API Gateway.
+
+        Почему граница важна для фронта: гейтвей режет запрос ДО приложения и
+        отвечает своим 413 без CORS-заголовков, поэтому в браузере это не «фото
+        слишком большое», а «Failed to fetch». Пока наш лимит ниже
+        платформенного, 413 отдаёт сам сервис — с CORS и внятным текстом
+        (п. 10 баг-репорта 06.08.2026). Кадр с камеры телефона (3–6 МБ) нужно
+        сжимать перед отправкой; кадр из canvas на экране распознавания
+        (~0,5 МБ) проходит как есть.
       operationId: recognizeExhibit
       security: []
       requestBody:
@@ -577,7 +600,7 @@ paths:
                 file:
                   type: string
                   format: binary
-                  description: Фото экспоната (JPEG/PNG/WebP, до 10 МБ).
+                  description: Фото экспоната (JPEG/PNG/WebP, до 2,5 МБ).
                 hall_id:
                   type: integer
                   minimum: 1
@@ -1003,9 +1026,16 @@ paths:
       summary: Загрузить обложку зала
       description: >-
         Загрузка обложки зала (`multipart/form-data`, поле `file`). Лимиты:
-        размер ≤ `MAX_UPLOAD_MB` (по умолчанию 10 МБ), форматы JPEG / PNG / WebP.
+        размер ≤ `MAX_UPLOAD_MB` (по умолчанию 2,5 МБ), форматы JPEG / PNG / WebP.
         URL объекта записывается в `cover_image_url` зала; отдельная миниатюра
         не генерируется. Прежняя обложка удаляется из хранилища (best-effort).
+
+
+        `MAX_UPLOAD_MB` держат ниже платформенной границы Yandex API Gateway —
+        3,5 МиБ (3 670 016 байт) на весь запрос. Файл крупнее гейтвей режет до
+        приложения и отвечает 413 без CORS-заголовков, то есть в админке это
+        выглядит как «Failed to fetch», а не как понятная ошибка. Поднять 3,5 МиБ
+        можно только конфигурацией API Gateway (п. 10 баг-репорта 06.08.2026).
       operationId: uploadHallCover
       security:
         - bearerAuth: []
@@ -1022,7 +1052,7 @@ paths:
                 file:
                   type: string
                   format: binary
-                  description: Изображение обложки (JPEG/PNG/WebP, ≤ MAX_UPLOAD_MB МБ).
+                  description: Изображение обложки (JPEG/PNG/WebP, ≤ MAX_UPLOAD_MB — 2,5 МБ).
       responses:
         '201':
           description: Обложка загружена, возвращается обновлённый зал.
@@ -1306,9 +1336,16 @@ paths:
       description: >-
         Загрузка изображения экспоната (`multipart/form-data`: поле `file`,
         опционально `is_primary`). Лимиты: размер ≤ `MAX_UPLOAD_MB` (по
-        умолчанию 10 МБ), форматы JPEG / PNG / WebP. Ответ содержит `image_id`
+        умолчанию 2,5 МБ), форматы JPEG / PNG / WebP. Ответ содержит `image_id`
         для последующего `DELETE .../media/{image_id}`. `thumbnail_url` сейчас
         совпадает с `image_url` — отдельная миниатюра не генерируется.
+
+
+        `MAX_UPLOAD_MB` держат ниже платформенной границы Yandex API Gateway —
+        3,5 МиБ (3 670 016 байт) на весь запрос. Файл крупнее гейтвей режет до
+        приложения и отвечает 413 без CORS-заголовков, то есть в админке это
+        выглядит как «Failed to fetch», а не как понятная ошибка. Поднять 3,5 МиБ
+        можно только конфигурацией API Gateway (п. 10 баг-репорта 06.08.2026).
       operationId: uploadExhibitMedia
       security:
         - bearerAuth: []
@@ -1325,7 +1362,7 @@ paths:
                 file:
                   type: string
                   format: binary
-                  description: Изображение (JPEG/PNG/WebP, ≤ MAX_UPLOAD_MB МБ).
+                  description: Изображение (JPEG/PNG/WebP, ≤ MAX_UPLOAD_MB — 2,5 МБ).
                 is_primary:
                   type: boolean
                   default: false
@@ -1527,15 +1564,40 @@ paths:
       tags: [Администрирование]
       summary: 'Аналитика: длительность визита и вовлечённость'
       description: >-
-        Длительность считается по ВИЗИТАМ: поток событий сессии режется по
-        неактивности дольше SESSION_TIMEOUT_MINUTES (30 минут). Вкладка,
+        Всё считается по ВИЗИТАМ, а не по сессии целиком: поток событий сессии
+        режется по неактивности дольше SESSION_TIMEOUT_MINUTES (30 минут). Вкладка,
         открытая утром и ожившая через четыре часа, даёт два визита, а не один
         на четыре часа, и расчёт не зависит от того, дошёл ли `session_end`.
 
 
-        Кроме длительности: сколько экспонатов посмотрели и вопросов задали за
-        визит и какая доля дошла до диалога с гидом. Знаменатель конверсий —
-        визиты с `app_open`; пока фронт его не шлёт, берутся все визиты.
+        Формулировки плиток дашборда (п. 7 баг-репорта 06.08.2026 — их фронт
+        вешает подсказками рядом с цифрами; полный разбор полей —
+        `docs/analytics-metrics.md`):
+
+
+        * **Средний визит** (`avg_duration_sec`) — среднее время одного
+        посещения, от первого действия до последнего, по всему приложению
+        целиком. Если посетитель не трогал приложение дольше 30 минут, всё, что
+        он сделает потом, считается уже новым визитом.
+
+        * **Конверсия в диалог** (`chat_conversion_rate`) — доля визитов, в
+        которых посетитель открыл чат с гидом, от всех визитов, где приложение
+        запускалось.
+
+        * **Глубина визита** (`avg_exhibits_per_session`) — среднее число разных
+        экспонатов, открытых за один визит; повторные открытия того же экспоната
+        не считаются.
+
+
+        Знаменатель конверсий виден в ответе, а не подразумевается:
+        `conversion_basis` показывает, от чего посчитана доля, а
+        `conversion_denominator` — само число визитов в знаменателе. Числители
+        (`chat_conversion_numerator`, `question_conversion_numerator`) считаются
+        ВНУТРИ той же базы, поэтому доля по построению ≤ 1.0.
+
+
+        Кроме длительности и конверсий: сколько экспонатов посмотрели и вопросов
+        задали за визит.
       operationId: getAnalyticsEngagement
       security:
         - bearerAuth: []
@@ -1892,16 +1954,43 @@ paths:
       summary: 'Аналитика: выгрузка отчёта в .xlsx / .pdf'
       description: >-
         Отдаёт отчёт файлом за тем же Bearer, что и остальная админка.
-        `.xlsx` — один лист на отчёт, числа числами (музей сводит их в Excel
-        формулами). `.pdf` — таблицы с шапкой периода и датой формирования.
+        `.xlsx` — числа числами (музей сводит их в Excel формулами), даты — датой
+        ячейки, шапка листа закреплена. `.pdf` — таблицы с шапкой периода и датой
+        формирования.
+
+
+        **`report=all` — вся аналитика одним файлом** (п. 6 баг-репорта
+        06.08.2026: «кнопка сверху дашборда»). Раньше, чтобы получить всё,
+        приходилось нажимать шесть кнопок и склеивать шесть файлов. Теперь
+        `.xlsx` — один файл: лист-оглавление плюс лист на каждый отчёт с
+        говорящими именами листов; `.pdf` — один документ: титул со списком
+        разделов плюс раздел на каждый отчёт с новой страницы. Период
+        учитывается ровно так же, как в одиночных отчётах.
+
+
+        **`report=engagement`** выгружается наравне с остальными шестью и входит
+        в `report=all`: именно этот отчёт считает плитки «Средний визит»,
+        «Конверсия в диалог» и «Глубина визита» (п. 7), не иметь для них выгрузки
+        было странно.
+
+
+        Раздел, который не удалось посчитать, в режиме `all` не роняет весь
+        файл — лист/раздел остаётся на месте с пометкой «нет данных». Одиночный
+        отчёт по-прежнему отвечает 500: там пустой файл хуже ошибки.
 
 
         Кириллица в PDF требует TTF-шрифта: путь задаётся переменной окружения
         ANALYTICS_PDF_FONT_PATH либо файл кладётся в assets/fonts/DejaVuSans.ttf.
-        Без шрифта эндпоинт возвращает 503, а не лист с квадратами.
+        Без шрифта эндпоинт возвращает 503 с текстом «что доложить в сборку», а
+        не лист с квадратами. Есть ли шрифт в этой сборке, видно заранее в
+        `GET /health` → `dependencies.pdf_font` (`up` / `down`), не нажимая
+        кнопку.
 
 
-        Имя файла — `faberge-<report>-<from>-<to>.<ext>`.
+        Имя файла — `faberge-<report>-<from>-<to>.<ext>`, для `report=all` —
+        `faberge-analytics-<from>-<to>.<ext>`. Открытая граница периода
+        подставляется как `all`: без `from` и `to` получится
+        `faberge-analytics-all-all.xlsx`.
       operationId: exportAnalytics
       security:
         - bearerAuth: []
@@ -1909,9 +1998,13 @@ paths:
         - name: report
           in: query
           required: true
+          description: >-
+            Имя отчёта либо `all` — все семь отчётов одним файлом (лист/раздел на
+            отчёт). `engagement` — метрики визита из
+            `GET /admin/analytics/engagement`.
           schema:
             type: string
-            enum: [overview, questions, unanswered, exhibits, routes, recognition]
+            enum: [overview, questions, unanswered, engagement, exhibits, routes, recognition, all]
         - name: format
           in: query
           required: false
@@ -1943,7 +2036,9 @@ paths:
           description: Файл отчёта.
           headers:
             Content-Disposition:
-              description: attachment; filename="faberge-<report>-<from>-<to>.<ext>"
+              description: >-
+                attachment; filename="faberge-<report>-<from>-<to>.<ext>";
+                для `report=all` — filename="faberge-analytics-<from>-<to>.<ext>".
               schema:
                 type: string
           content:
@@ -1962,11 +2057,20 @@ paths:
         '503':
           description: >-
             Выгрузка недоступна: не установлена библиотека (openpyxl/reportlab)
-            либо не найден шрифт с кириллицей для PDF.
+            либо не найден пригодный шрифт с кириллицей для PDF. Отчёт при этом
+            посчитан — не хватает только средства рендеринга, поэтому 503, а не
+            500. В `detail` — что именно доложить в сборку. Проверяется заранее:
+            `GET /health` → `dependencies.pdf_font`.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+              example:
+                detail: >-
+                  Не найден шрифт с кириллицей для PDF. Укажите путь к TTF в
+                  переменной окружения ANALYTICS_PDF_FONT_PATH (например,
+                  DejaVuSans.ttf) или положите файл в
+                  assets/fonts/DejaVuSans.ttf.
 
   # ───────────────────────────── Телеметрия ──────────────────────────────
   /telemetry/events:
@@ -2140,13 +2244,30 @@ components:
           example:
             detail: Экспонат с таким label_slug уже существует.
     PayloadTooLarge:
-      description: Файл превышает допустимый размер (10 МБ).
+      description: >-
+        Файл превышает допустимый размер — `MAX_UPLOAD_MB`, по умолчанию 2,5 МБ
+        (до 06.08.2026 контракт обещал 10 МБ, которых платформа не даёт).
+
+
+        Этот 413 отдаёт приложение — с CORS-заголовками, поэтому браузер видит и
+        код, и текст. Файл крупнее платформенной границы Yandex API Gateway
+        (3,5 МиБ = 3 670 016 байт на весь запрос) до приложения не доходит вовсе:
+        гейтвей отвечает своим 413 без CORS, и в браузере это «Failed to fetch»,
+        а не «фото слишком большое». Ради этого наш лимит и держат ниже
+        платформенного (п. 10 баг-репорта 06.08.2026).
+
+
+        `POST /recognition` отвечает текстом для посетителя, с фактическим
+        размером кадра; админские загрузки — короткой служебной формулировкой
+        «Размер файла превышает 2.5 МБ.».
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
           example:
-            detail: Размер файла превышает 10 МБ.
+            detail: >-
+              Фото слишком большое — 3,7 МБ при допустимых 2,5 МБ. Сожмите
+              изображение или снимите кадр с меньшим разрешением.
     UnsupportedMediaType:
       description: Неподдерживаемый формат файла.
       content:
@@ -2190,7 +2311,11 @@ components:
           example: '2026-05-30T10:00:00Z'
         dependencies:
           type: object
-          description: Доступность внешних зависимостей.
+          description: >-
+            Доступность внешних зависимостей. `pdf_font` — не внешний сервис, а
+            наличие пригодного TTF с кириллицей для PDF-выгрузки аналитики
+            (п. 3 баг-репорта 06.08.2026): `down` = экспорт в PDF ответит 503,
+            но на `status` это не влияет.
           additionalProperties:
             type: string
             enum: [up, down]
@@ -2200,6 +2325,7 @@ components:
             yolo: up
             yandexgpt: up
             speechkit: up
+            pdf_font: up
 
     # ── Залы ──
     Hall:
@@ -3503,6 +3629,12 @@ components:
         неактивности дольше SESSION_TIMEOUT_MINUTES (30 минут), поэтому вкладка,
         открытая утром и ожившая через четыре часа, даёт два визита, а не один
         на четыре часа — и расчёт не зависит от того, дошёл ли session_end.
+
+
+        Имена `sessions_with_*` и `avg_*_per_session` остались с тех пор, когда
+        длительность считалась по сессии целиком; считаются они по визитам —
+        переименование сломало бы фронт. Полный справочник полей, включая «на что
+        метрика не годится», — `docs/analytics-metrics.md`.
       properties:
         from:
           type: string
@@ -3525,6 +3657,11 @@ components:
         avg_duration_sec:
           type: number
           default: 0
+          description: >-
+            **Средний визит.** Среднее время одного посещения — от первого
+            действия до последнего, по всему приложению целиком. Если посетитель
+            не трогал приложение дольше 30 минут, всё, что он сделает потом,
+            считается уже новым визитом.
           example: 214.5
         median_duration_sec:
           type: number
@@ -3546,7 +3683,10 @@ components:
         avg_exhibits_per_session:
           type: number
           default: 0
-          description: Среднее число уникальных exhibit_view за визит.
+          description: >-
+            **Глубина визита.** Среднее число разных экспонатов, открытых за один
+            визит; повторные открытия того же экспоната не считаются (уникальные
+            exhibit_id в событиях exhibit_view).
           example: 4.1
         avg_questions_per_session:
           type: number
@@ -3556,36 +3696,91 @@ components:
         sessions_with_chat:
           type: integer
           default: 0
-          description: Визитов хотя бы с одним chat_open.
+          description: >-
+            Визитов хотя бы с одним chat_open — ВСЕГО за период. Это не числитель
+            конверсии: в долю идёт chat_conversion_numerator (подмножество этого
+            числа, попавшее в базу).
           example: 410
         sessions_with_questions:
           type: integer
           default: 0
-          description: Визитов хотя бы с одним chat_message.
+          description: >-
+            Визитов хотя бы с одним chat_message — всего за период. Числитель
+            доли — question_conversion_numerator.
           example: 320
         sessions_with_app_open:
           type: integer
           default: 0
           description: >-
-            Знаменатель конверсий. Если app_open не приходил ни разу (фронт ещё
-            не шлёт), знаменателем становится total_visits.
+            Визитов, где приложение запускали (событие app_open; фронт шлёт его
+            с 04.08.2026). При conversion_basis = app_open совпадает с
+            conversion_denominator, при фолбэке — нет (там ноль).
           example: 1300
+        conversion_basis:
+          type: string
+          enum: [app_open, all_visits]
+          default: all_visits
+          description: >-
+            На чём построен знаменатель конверсий (п. 7 баг-репорта 06.08.2026).
+            `app_open` — база из визитов с запуском приложения, штатный режим.
+            `all_visits` — фолбэк: за период не пришло ни одного app_open (данные
+            до 04.08.2026), иначе метрика показывала бы ноль при живом трафике.
+
+
+            Это не метрика, а пометка о сопоставимости: доли с разным
+            `conversion_basis` сравнивать нельзя — менялась не аудитория, а база
+            расчёта. Период, пересекающий 04.08.2026, считается по базе
+            `app_open`, то есть доля описывает только ту его часть, где фронт уже
+            слал событие; насколько период «смешанный», видно по разрыву между
+            conversion_denominator и total_visits.
+          example: app_open
+        conversion_denominator:
+          type: integer
+          default: 0
+          description: >-
+            Само число визитов, на которое делили. Отдаётся явно, чтобы долю
+            можно было проверить и сравнить: раньше знаменатель приходилось
+            угадывать, сопоставляя sessions_with_app_open с total_visits.
+          example: 1300
+        chat_conversion_numerator:
+          type: integer
+          default: 0
+          description: >-
+            Числитель «конверсии в диалог»: визиты ВНУТРИ базы, где был chat_open.
+            Подмножество sessions_with_chat (при basis = all_visits совпадает
+            с ним). Отдаётся, чтобы дашборд не пересчитывал долю сам «от всего» —
+            так получалось больше 100 %.
+          example: 406
+        question_conversion_numerator:
+          type: integer
+          default: 0
+          description: >-
+            Числитель доли визитов с вопросом: визиты внутри базы, где был
+            chat_message. Подмножество sessions_with_questions.
+          example: 318
         chat_conversion_rate:
           type: number
           format: float
           minimum: 0
           maximum: 1
           default: 0
-          description: Доля визитов, дошедших до экрана чата с гидом.
-          example: 0.32
+          description: >-
+            **Конверсия в диалог.** Доля визитов, в которых посетитель открыл чат
+            с гидом, от всех визитов, где приложение запускалось.
+            chat_conversion_numerator / conversion_denominator, округление до 4
+            знаков. Доля, а не проценты: умножать на 100 при отрисовке.
+          example: 0.3123
         question_conversion_rate:
           type: number
           format: float
           minimum: 0
           maximum: 1
           default: 0
-          description: Доля визитов, в которых задали хотя бы один вопрос.
-          example: 0.25
+          description: >-
+            Доля визитов, в которых задали хотя бы один вопрос:
+            question_conversion_numerator / conversion_denominator. Не то же, что
+            конверсия в диалог: открыть чат ≠ спросить.
+          example: 0.2446
         buckets:
           type: array
           items:

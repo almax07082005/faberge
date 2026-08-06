@@ -41,3 +41,11 @@ htmlcov/
 
 # Сборочный артефакт Yandex Cloud Functions
 faberge-fn.zip
+
+# ── Шрифт для PDF-выгрузки аналитики ──────────────────────────────────────
+# Бинарник (~750 КБ) в git не кладём — он добирается на сборке:
+# в докер-образе пакетом fonts-dejavu-core (см. Dockerfile), в зип-архиве
+# функции — `python scripts/fetch_pdf_font.py` перед упаковкой.
+assets/fonts/*.ttf
+# Недокачанный файл от прерванного прогона скрипта (пишем через <имя>.ttf.part).
+assets/fonts/*.part

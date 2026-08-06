@@ -1135,6 +1135,10 @@ async def analytics_engagement(
     режется по неактивности дольше SESSION_TIMEOUT_MINUTES (§5), поэтому
     вкладка, открытая утром и вернувшаяся к жизни через четыре часа, даёт два
     визита, а не один на четыре часа.
+
+    Конверсии считаются от базы, которую возвращает `visits.conversion_stats`:
+    числитель и знаменатель берутся из одной и той же выборки визитов (п.7
+    баг-репорта 06.08.2026), поэтому доля не может оказаться больше 100%.
     """
     rows = await _visit_rows(session, dfrom, dto)
 
@@ -1143,7 +1147,9 @@ async def analytics_engagement(
     exhibit_counts: List[int] = []
     question_counts: List[int] = []
     sessions: Set = set()
-    with_chat = with_questions = with_app_open = 0
+    # Признаки визитов для конверсий — считаются в одном проходе, а сама база
+    # (все визиты или только с `app_open`) выбирается уже после цикла.
+    flags: List[visits.VisitFlags] = []
 
     for session_id, events in visits.visits_by_session(rows):
         sessions.add(session_id)
@@ -1155,18 +1161,22 @@ async def analytics_engagement(
         questions = sum(1 for e in events if e.type == "chat_message")
         question_counts.append(questions)
         types = {e.type for e in events}
-        if "chat_open" in types:
-            with_chat += 1
-        if questions:
-            with_questions += 1
-        if "app_open" in types:
-            with_app_open += 1
+        flags.append(
+            visits.VisitFlags(
+                has_app_open="app_open" in types,
+                has_chat_open="chat_open" in types,
+                has_question=bool(questions),
+            )
+        )
 
     total_visits = len(durations)
-    # Конверсия считается от визитов с app_open. Пока фронт не начал слать
-    # app_open, знаменателя не будет — тогда берём все визиты, иначе метрика
-    # выглядела бы нулевой при живом трафике.
-    denominator = with_app_open or total_visits
+    # База конверсий: визиты с `app_open`, если он в периоде вообще приходил
+    # (фронт шлёт с 04.08.2026), иначе — все визиты. Числитель считается ВНУТРИ
+    # базы, поэтому доли до и после 04.08.2026 сравнивать между собой нельзя:
+    # у них разный знаменатель. Что именно взято за базу и сколько там визитов,
+    # ручка теперь отдаёт явно (`conversion_basis`, `conversion_denominator`) —
+    # чтобы вопрос «не завышена ли конверсия» проверялся по числам, а не на слово.
+    conversions = visits.conversion_stats(flags)
 
     buckets = [
         sch.AnalyticsDurationBucket(
@@ -1185,11 +1195,17 @@ async def analytics_engagement(
         avg_events_per_session=round(statistics.fmean(event_counts), 2) if event_counts else 0.0,
         avg_exhibits_per_session=round(statistics.fmean(exhibit_counts), 2) if exhibit_counts else 0.0,
         avg_questions_per_session=round(statistics.fmean(question_counts), 2) if question_counts else 0.0,
-        sessions_with_chat=with_chat,
-        sessions_with_questions=with_questions,
-        sessions_with_app_open=with_app_open,
-        chat_conversion_rate=_rate(with_chat, denominator),
-        question_conversion_rate=_rate(with_questions, denominator),
+        # «Всего» — по всем визитам периода: на этих полях уже завязан дашборд,
+        # их смысл не меняем. Для доли рядом едут числители, согласованные с базой.
+        sessions_with_chat=conversions.visits_with_chat,
+        sessions_with_questions=conversions.visits_with_questions,
+        sessions_with_app_open=conversions.visits_with_app_open,
+        conversion_basis=conversions.basis,
+        conversion_denominator=conversions.denominator,
+        chat_conversion_numerator=conversions.chat_numerator,
+        question_conversion_numerator=conversions.question_numerator,
+        chat_conversion_rate=conversions.chat_rate,
+        question_conversion_rate=conversions.question_rate,
         buckets=buckets,
     )
 

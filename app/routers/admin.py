@@ -1,6 +1,7 @@
 """Администрирование [вне MVP]: CRUD экспонатов, медиа, аналитика."""
 from __future__ import annotations
 
+import logging
 from datetime import date
 from io import BytesIO
 from typing import Optional
@@ -22,6 +23,8 @@ auth_router = APIRouter(prefix="/admin", tags=["Администрировани
 router = APIRouter(prefix="/admin", tags=["Администрирование"], dependencies=[Depends(require_admin)])
 
 _ALLOWED_IMG = {"image/jpeg", "image/png", "image/webp"}
+
+logger = logging.getLogger(__name__)
 
 
 @auth_router.post(
@@ -45,8 +48,12 @@ async def _read_validated_image(file: UploadFile) -> bytes:
     if file.content_type not in _ALLOWED_IMG:
         raise HTTPException(status_code=415, detail="Поддерживаются только JPEG, PNG и WebP.")
     data = await file.read()
-    if len(data) > settings.max_upload_mb * 1024 * 1024:
-        raise HTTPException(status_code=413, detail=f"Размер файла превышает {settings.max_upload_mb} МБ.")
+    # П.10: сверяемся с max_upload_bytes (уже зажатым под лимит API Gateway), а не
+    # с заявленным max_upload_mb. В окружении прода стоит MAX_UPLOAD_MB=10, и по
+    # заявленному числу админка пропускала бы файл, который гейтвей режет на
+    # 3.5 МиБ, — админ получал бы «Failed to fetch» вместо внятного 413.
+    if len(data) > settings.max_upload_bytes:
+        raise HTTPException(status_code=413, detail=f"Размер файла превышает {settings.max_upload_label}.")
     return data
 
 
@@ -119,7 +126,7 @@ async def reorder_halls(
     summary="Загрузить обложку зала",
     description=(
         "Загрузка обложки зала (`multipart/form-data`, поле `file`). Лимиты: "
-        f"размер ≤ {settings.max_upload_mb} МБ, форматы JPEG / PNG / WebP. "
+        f"размер ≤ {settings.max_upload_label}, форматы JPEG / PNG / WebP. "
         "URL объекта записывается в `cover_image_url` зала; отдельная миниатюра не генерируется."
     ),
 )
@@ -354,7 +361,7 @@ async def list_media(
     summary="Загрузить фото экспоната",
     description=(
         "Загрузка фото экспоната (`multipart/form-data`: поле `file`, опционально `is_primary`). "
-        f"Лимиты: размер ≤ {settings.max_upload_mb} МБ, форматы JPEG / PNG / WebP. "
+        f"Лимиты: размер ≤ {settings.max_upload_label}, форматы JPEG / PNG / WebP. "
         "Возвращает `image_id` (для последующего `DELETE .../media/{image_id}`). "
         "`thumbnail_url` сейчас совпадает с `image_url` — отдельная миниатюра не генерируется. "
         "При `is_primary=true` фото становится главным (`exhibits.image_url`)."
@@ -490,13 +497,29 @@ async def analytics_unanswered(
     "/analytics/engagement", response_model=sch.AnalyticsEngagement,
     summary="Аналитика: длительность визита и вовлечённость",
     description=(
-        "Длительность считается по ВИЗИТАМ, а не по сессии целиком: поток событий "
-        "режется по неактивности дольше `SESSION_TIMEOUT_MINUTES` (30 минут), поэтому "
-        "вкладка, открытая утром и ожившая через четыре часа, даёт два визита, а не "
-        "один на четыре часа — и не зависит от того, дошёл ли `session_end`.\n\n"
-        "Кроме длительности: сколько экспонатов посмотрели и вопросов задали за визит, "
-        "и какая доля дошла до диалога с гидом. Знаменатель конверсий — визиты с "
-        "`app_open`; пока фронт его не шлёт, берутся все визиты. " + _PERIOD_DESC
+        "Всё считается по ВИЗИТАМ, а не по сессии целиком, и не зависит от того, дошёл "
+        "ли `session_end`.\n\n"
+        "Формулировки плиток дашборда (п. 7 баг-репорта 06.08.2026 — их фронт вешает "
+        "подсказками рядом с цифрами, чтобы вопрос «что это за метрика» не возвращался):\n\n"
+        "* **Средний визит** — среднее время от первого до последнего события визита, "
+        "по всему приложению. Поток событий режется по неактивности дольше "
+        "`SESSION_TIMEOUT_MINUTES` (30 минут): вкладка, открытая утром и ожившая "
+        "вечером, даёт два визита, а не один на весь день.\n"
+        "* **Конверсия в диалог** — доля визитов, где посетитель открыл чат с гидом "
+        "(событие `chat_open`), от визитов, в которых приложение вообще запускалось "
+        "(событие `app_open`).\n"
+        "* **Глубина визита** — среднее число РАЗНЫХ экспонатов, открытых за визит "
+        "(уникальные `exhibit_view`).\n\n"
+        "Знаменатель конверсий виден в ответе, а не подразумевается: "
+        "`conversion_basis` — от чего именно посчитана доля (`app_open` — визиты с "
+        "запуском приложения, как и задумано; `all_visits` — фолбэк для периодов, где "
+        "событие `app_open` ещё не долетало и знаменатель вышел бы нулевым), "
+        "`conversion_denominator` — само число визитов, попавшее в знаменатель. Без "
+        "этих полей одна и та же «доля» на разных периодах молча считалась бы от разных "
+        "величин: фронт шлёт `app_open` только с 04.08.2026, и цифры сопоставимы между "
+        "собой начиная с этой даты.\n\n"
+        "Кроме длительности и конверсий: сколько экспонатов посмотрели и вопросов "
+        "задали за визит. " + _PERIOD_DESC
     ),
 )
 async def analytics_engagement(
@@ -624,38 +647,87 @@ async def analytics_rebuild(
     return await crud.rebuild_analytics(session, from_, to)
 
 
+_XLSX_MEDIA = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
 @router.get(
     "/analytics/export",
     summary="Аналитика: выгрузка отчёта в .xlsx / .pdf",
     description=(
-        "Отдаёт отчёт файлом за тем же Bearer, что и остальная админка. "
-        "`.xlsx` — один лист на отчёт, числа числами (музей сводит их в Excel "
-        "формулами). `.pdf` — таблицы с шапкой периода и датой формирования; "
-        "кириллица требует TTF-шрифта (`ANALYTICS_PDF_FONT_PATH` либо "
-        "`assets/fonts/DejaVuSans.ttf`), иначе выгрузка вернёт 503, а не лист с "
-        "квадратами. Имя файла — `faberge-<report>-<from>-<to>.<ext>`."
+        "Отдаёт отчёт файлом за тем же Bearer, что и остальная админка.\n\n"
+        "**`report=all` — вся аналитика одним файлом** (п. 6 баг-репорта 06.08.2026: "
+        "«кнопка сверху дашборда»). Раньше, чтобы получить всё, приходилось нажимать "
+        "шесть кнопок и склеивать шесть файлов. В `.xlsx` это лист на каждый отчёт с "
+        "говорящими именами листов, в `.pdf` — раздел на каждый отчёт в одном "
+        "документе. Период учитывается ровно так же, как в одиночных отчётах, имя "
+        "файла — `faberge-analytics-<from>-<to>.<ext>`.\n\n"
+        "**`report=engagement`** выгружается наравне с остальными шестью: именно этот "
+        "отчёт считает плитки «Средний визит», «Конверсия в диалог» и «Глубина визита», "
+        "про которые спрашивает заказчик (п. 7), — не иметь для них выгрузки было "
+        "странно. В `report=all` он тоже входит.\n\n"
+        "`.xlsx` — числа числами (музей сводит их в Excel формулами), даты — датой "
+        "ячейки, шапка закреплена. `.pdf` — таблицы с шапкой периода и датой "
+        "формирования; кириллица требует TTF-шрифта (`ANALYTICS_PDF_FONT_PATH` либо "
+        "`assets/fonts/DejaVuSans.ttf`), иначе выгрузка вернёт 503 с текстом «что "
+        "доложить», а не лист с квадратами. Есть ли шрифт в этой сборке, видно заранее "
+        "в `GET /health` → `dependencies.pdf_font` (`up`/`down`) — не нажимая кнопку.\n\n"
+        "Имя файла одиночного отчёта — `faberge-<report>-<from>-<to>.<ext>`."
     ),
-    responses={200: {"content": {
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {},
-        "application/pdf": {},
-    }, "description": "Файл отчёта."}},
+    responses={
+        200: {"content": {_XLSX_MEDIA: {}, "application/pdf": {}}, "description": "Файл отчёта."},
+        503: {"description": "Выгрузка невозможна: нет шрифта для PDF или библиотеки формата."},
+    },
 )
 async def export_analytics(
-    report: str = Query(..., pattern="^(overview|questions|unanswered|exhibits|routes|recognition)$"),
+    report: str = Query(
+        ...,
+        pattern="^(overview|questions|unanswered|engagement|exhibits|routes|recognition|all)$",
+        description="Имя отчёта либо `all` — все отчёты одним файлом.",
+    ),
     format: str = Query("xlsx", pattern="^(xlsx|pdf)$"),
     from_: Optional[date] = Query(None, alias="from"),
     to: Optional[date] = Query(None),
     session: AsyncSession = Depends(get_session),
 ) -> StreamingResponse:
-    payload = (await crud.build_report(session, report, from_, to)).model_dump(mode="json", by_alias=True)
+    # Отчёты для report=all собираем ПОСЛЕДОВАТЕЛЬНО и тем же session: одна
+    # AsyncSession не выдерживает параллельных запросов, а гнать их и не нужно —
+    # build_report берёт готовые агрегаты из кэша (промах считается один раз и
+    # запоминается), так что семь проходов дешевле, чем выглядят.
+    names = analytics_export.ALL_REPORTS if report == "all" else (report,)
+    payloads: dict = {}
+    for name in names:
+        try:
+            payloads[name] = (
+                await crud.build_report(session, name, from_, to)
+            ).model_dump(mode="json", by_alias=True)
+        except Exception:
+            # Общий отчёт (п.6) — это кнопка «скачать всё»: падение одного тяжёлого
+            # раздела (exhibits по 1253 карточкам, routes с построением путей) не
+            # должно уносить шесть уже посчитанных. Пустой payload рендеры умеют:
+            # лист/раздел остаётся с пометкой «Нет данных за выбранный период», и
+            # заказчик видит, что раздел не потерялся, а не пустой 500 без текста.
+            # Одиночный отчёт по-прежнему падает: там 500 честнее пустого файла.
+            if len(names) == 1:
+                raise
+            logger.exception("analytics export: раздел %r не посчитан, уходит пустым", name)
+            payloads[name] = {}
+
     try:
         if format == "pdf":
-            data = analytics_export.to_pdf(report, payload)
+            data = (
+                analytics_export.to_pdf_all(payloads) if report == "all"
+                else analytics_export.to_pdf(report, payloads[report])
+            )
             media_type = "application/pdf"
         else:
-            data = analytics_export.to_xlsx(report, payload)
-            media_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            data = (
+                analytics_export.to_xlsx_all(payloads) if report == "all"
+                else analytics_export.to_xlsx(report, payloads[report])
+            )
+            media_type = _XLSX_MEDIA
     except analytics_export.ExportError as exc:
+        # Не 500: отчёт посчитан, не хватает шрифта или пакета формата. Текст
+        # exc.message говорит администратору, что именно доложить в сборку.
         raise HTTPException(status_code=503, detail=exc.message)
 
     name = analytics_export.file_name(report, from_, to, format)
