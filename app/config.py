@@ -103,7 +103,22 @@ class Settings(BaseSettings):
     # ── Yandex Cloud (опционально; без ключей сервисы работают в режиме-стабе) ─
     yandex_api_key: Optional[str] = None
     yandex_folder_id: Optional[str] = None
-    yandexgpt_model_uri: Optional[str] = None     # gpt://<folder>/yandexgpt/latest
+    yandexgpt_model_uri: Optional[str] = None     # gpt://<folder>/deepseek-v4-flash/latest
+    # OpenAI-совместимый шлюз Yandex Cloud. Прежний foundationModels/v1 отдаёт
+    # только семейство yandexgpt: запрос deepseek/qwen/gpt-oss туда возвращает
+    # 404 `unknown model`. Полный каталог виден лишь через GET {base}/models.
+    llm_api_base: str = "https://ai.api.cloud.yandex.net/v1"
+    # Управление «размышлениями» reasoning-моделей (deepseek-v4-flash и т. п.).
+    # Пусто — параметр не отправляется (поведение модели по умолчанию).
+    # ВАЖНО: у deepseek-v4-flash reasoning включён по умолчанию и списывается
+    # как completion-токены. При max_tokens=800 размышления съедают весь бюджет,
+    # ответ приходит с finish_reason=length и ПУСТЫМ content. `none` выключает
+    # их целиком — для задач гида цепочка рассуждений не нужна.
+    llm_reasoning_effort: Optional[str] = "none"
+    # Потолок рассказа /guide/story. Прежних 800 хватало YandexGPT (~280 токенов),
+    # но deepseek-v4-flash пишет в 2.4 раза длиннее и обрывался на полуслове.
+    # Обрыв хуже длинноты: посетитель получает текст без конца, а TTS его озвучит.
+    llm_max_tokens_story: int = 1500
     yolo_endpoint: Optional[str] = None           # HTTP-эндпоинт развёрнутой YOLO
     speechkit_api_key: Optional[str] = None
     object_storage_bucket: Optional[str] = None
