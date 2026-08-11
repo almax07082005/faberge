@@ -220,28 +220,54 @@ async def _llm_complete(system: str, user: str, temperature: float = 0.6, max_to
     raise UpstreamError("Сервис генерации текста вернул пустой ответ.")
 
 
-async def _llm_story(exhibit: Dict, style: str, language: str) -> str:
-    # Промпт из роадмапа. «Год» в нём заменён на «датировку»: раньше в промпт уходил
-    # year_created — нижняя граница диапазона, — и модель уверенно писала «созданное
-    # в 1899 году» про предмет, датированный «1899–1903», а у вековых датировок
-    # получала «год: None» и придумывала дату сама (баг-репорт 12.08.2026, п.5).
-    # Отдаём строку путеводителя как есть, year_created — только если dating пуст.
-    raw = exhibit.get("raw_history") or exhibit.get("short_description") or ""
+def exhibit_facts(exhibit: Dict) -> str:
+    """Карточка экспоната для промпта: чем предмет является и что о нём известно.
+
+    Раньше в промпт уходил только ``raw_history``. Это техническая карточка
+    (Фирма / Дата / Мастер / Материалы / Техника / Зал), и слова «яйцо» в ней нет
+    у 7 экспонатов из 12 — модель не знала, ЧТО описывает, и угадывала:
+    «Коронационное» превращалось в «уникальную шкатулку». Название и атрибуция
+    берутся из отдельных колонок каталога, поэтому подаём их явно.
+
+    Тот же текст идёт и в справку для ``/guide/chat``: `master_name`, `material`,
+    датировка есть в БД, но в диалог не попадали, и на вопрос о мастере гид
+    отвечал «не знаю» при заполненной колонке.
+    """
+    # Датировка — строка путеводителя как есть («1899–1903», «конец XIX — начало
+    # XX века»). `year_created` держит только НИЖНЮЮ границу и пуст у вековых
+    # датировок, из-за чего гид писал «созданное в 1899 году» про предмет
+    # 1899–1903 (баг-репорт 12.08.2026, п.5). Оставляем его запасным вариантом.
     dating = (exhibit.get("dating") or "").strip() or (
         str(exhibit["year_created"]) if exhibit.get("year_created") else ""
     )
-    techniques = (exhibit.get("techniques") or "").strip()
+    parts: List[str] = []
+    for label, value in (
+        ("Экспонат", exhibit.get("name")),
+        ("Датировка", dating),
+        ("Мастер", exhibit.get("master_name")),
+        ("Материалы", exhibit.get("material")),
+        # Техники больше не лежат в material (всё после «;» каталожной строки —
+        # это techniques), а посетителя как раз интересует, как предмет сделан.
+        ("Техники исполнения", (exhibit.get("techniques") or "").strip()),
+    ):
+        if value:
+            parts.append(f"{label}: {value}")
+    for key in ("short_description", "raw_history"):
+        value = exhibit.get(key)
+        if value:
+            parts.append(str(value))
+    return "\n".join(parts)
+
+
+async def _llm_story(exhibit: Dict, style: str, language: str) -> str:
+    # Датировка и техники подаются через exhibit_facts вместе с остальной
+    # карточкой — пустые поля туда не попадают, поэтому «датировка: » или
+    # «год: None», которые модель трактовала как факт, исключены.
     user = (
-        f"Напиши интересную историю для посетителя музея, используя данные: {raw}, "
-        f"стиль: {_STYLE_HINT.get(style, 'живо и увлекательно')}"
+        "Напиши интересную историю для посетителя музея, используя данные:\n"
+        f"{exhibit_facts(exhibit)}\n"
+        f"Стиль: {_STYLE_HINT.get(style, 'живо и увлекательно')}."
     )
-    # Пустое поле в промпт не подаём: «датировка: » или «год: None» модель трактует
-    # как факт и дорисовывает недостающее.
-    if dating:
-        user += f", датировка: {dating}"
-    if techniques:
-        user += f", техники исполнения: {techniques}"
-    user += "."
     return await _llm_complete(
         "Ты — ИИ-гид музея Фаберже.", user, max_tokens=settings.llm_max_tokens_story
     )
@@ -282,10 +308,10 @@ async def _llm_chat(grounding: str, history: List[Tuple[str, str]], message: str
 async def _llm_questions(exhibit: Dict, max_questions: int, language: str) -> List[str]:
     if max_questions <= 0:
         return []
-    raw = exhibit.get("raw_history") or exhibit.get("short_description") or exhibit.get("name", "")
     user = (
-        f"На основе данных об экспонате ({raw}) предложи {max_questions} коротких вопроса, "
-        "которые посетитель захотел бы задать гиду. Каждый вопрос с новой строки, без нумерации."
+        f"На основе данных об экспонате ({exhibit_facts(exhibit)}) предложи {max_questions} "
+        "коротких вопроса, которые посетитель захотел бы задать гиду. "
+        "Каждый вопрос с новой строки, без нумерации."
     )
     text = await _llm_complete("Ты помогаешь придумать вопросы для диалога с гидом.", user, temperature=0.7, max_tokens=200)
     questions = [q.strip(" -•\t") for q in text.splitlines() if q.strip()]

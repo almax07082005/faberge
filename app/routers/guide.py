@@ -245,7 +245,10 @@ async def chat(req: sch.ChatRequest, session: AsyncSession = Depends(get_session
         if ex is not None:
             context_exhibit = ex
             exhibit_dict = crud.exhibit_to_dict(ex)
-            grounding = " ".join(p for p in (ex.short_description, ex.raw_history) if p)
+            # Не только описание с историей: название, мастер, материалы и год
+            # лежат в отдельных колонках, и без них гид отвечал «не знаю, кто
+            # мастер» при заполненном `master_name`.
+            grounding = llm.exhibit_facts(exhibit_dict)
             # hall_id берём из ПРИСЛАННОГО контекста, не из прежнего состояния
             # сессии: при переходе к экспонату другого зала старый зал не должен
             # оставаться приклеенным (баг-репорт 28.07.2026, п.3).
