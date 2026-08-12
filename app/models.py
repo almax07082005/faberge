@@ -108,6 +108,11 @@ class Exhibit(Base):
     year_created: Mapped[Optional[int]] = mapped_column(Integer)
     master_name: Mapped[Optional[str]] = mapped_column(String(255))
     material: Mapped[Optional[str]] = mapped_column(String(255))
+    # Датировка как в путеводителе («1899–1903», «конец XIX — начало XX века»): year_created
+    # выше — INT и держит только нижнюю границу, а у вековых датировок пуст (12.08.2026, п.5).
+    dating: Mapped[Optional[str]] = mapped_column(Text)
+    # Техники из хвоста каталожной строки (после «;») — отдельно от материалов.
+    techniques: Mapped[Optional[str]] = mapped_column(Text)
     short_description: Mapped[Optional[str]] = mapped_column(Text)
     short_description_spoken: Mapped[Optional[str]] = mapped_column(Text)
     raw_history: Mapped[Optional[str]] = mapped_column(Text)

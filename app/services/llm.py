@@ -98,16 +98,25 @@ async def chat(
 def _story_stub(exhibit: Dict, style: str) -> str:
     name = exhibit.get("name", "экспонат")
     year = exhibit.get("year_created")
+    dating = (exhibit.get("dating") or "").strip()
     master = exhibit.get("master_name")
     material = exhibit.get("material")
+    techniques = (exhibit.get("techniques") or "").strip()
     short = exhibit.get("short_description")
     raw = exhibit.get("raw_history")
 
+    # Датировку берём из dating, а year_created оставляем запасным вариантом: он держит
+    # только НИЖНЮЮ границу и пуст у вековых датировок, поэтому гид говорил «созданное
+    # в 1899 году» там, где в путеводителе «1899–1903», а на «конец XIX века» умалчивал
+    # о времени вовсе (баг-репорт 12.08.2026, п.5). Сама dating приходит именительной
+    # фразой («около 1912», «конец XIX — начало XX века»), в оборот «созданное в … году»
+    # её не поставить — поэтому вводная строится как подпись на музейной этикетке,
+    # перечислением через запятую. По той же причине не склоняем и мастера: в поле
+    # лежат и люди («Михаил Перхин»), и фирмы («Фирма К. Фаберже»).
+    label = [f for f in (dating or (f"{year} год" if year else ""), master) if f]
     intro = f"Перед вами {name}"
-    if year:
-        intro += f", созданное в {year} году"
-    if master:
-        intro += f" мастером {master}"
+    if label:
+        intro += ", " + ", ".join(label)
     intro += "."
 
     parts = [intro]
@@ -117,6 +126,11 @@ def _story_stub(exhibit: Dict, style: str) -> str:
         parts.append(raw)
     elif material:
         parts.append(f"В работе использованы материалы: {material}.")
+    # Техники — отдельной фразой и только когда они есть: в material их больше нет
+    # (всё после «;» в каталожной строке — это techniques), а посетителю как раз
+    # интересно, как предмет сделан.
+    if techniques:
+        parts.append(f"Техники исполнения: {techniques}.")
     parts.append(f"(Рассказ подготовлен {_STYLE_HINT.get(style, 'живо и увлекательно')}.)")
     return " ".join(parts)
 
@@ -172,12 +186,27 @@ async def _yandexgpt_complete(system: str, user: str, temperature: float = 0.6, 
 
 
 async def _yandexgpt_story(exhibit: Dict, style: str, language: str) -> str:
-    # Промпт из роадмапа.
+    # Промпт из роадмапа. «Год» в нём заменён на «датировку»: раньше в промпт уходил
+    # year_created — нижняя граница диапазона, — и модель уверенно писала «созданное
+    # в 1899 году» про предмет, датированный «1899–1903», а у вековых датировок
+    # получала «год: None» и придумывала дату сама (баг-репорт 12.08.2026, п.5).
+    # Отдаём строку путеводителя как есть, year_created — только если dating пуст.
     raw = exhibit.get("raw_history") or exhibit.get("short_description") or ""
+    dating = (exhibit.get("dating") or "").strip() or (
+        str(exhibit["year_created"]) if exhibit.get("year_created") else ""
+    )
+    techniques = (exhibit.get("techniques") or "").strip()
     user = (
         f"Напиши интересную историю для посетителя музея, используя данные: {raw}, "
-        f"стиль: {_STYLE_HINT.get(style, 'живо и увлекательно')}, год: {exhibit.get('year_created')}."
+        f"стиль: {_STYLE_HINT.get(style, 'живо и увлекательно')}"
     )
+    # Пустое поле в промпт не подаём: «датировка: » или «год: None» модель трактует
+    # как факт и дорисовывает недостающее.
+    if dating:
+        user += f", датировка: {dating}"
+    if techniques:
+        user += f", техники исполнения: {techniques}"
+    user += "."
     return await _yandexgpt_complete("Ты — ИИ-гид музея Фаберже.", user)
 
 

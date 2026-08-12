@@ -91,9 +91,16 @@ CREATE TABLE IF NOT EXISTS exhibits (
     label_slug        VARCHAR(100) UNIQUE,      -- класс, который возвращает YOLO
     exhibit_number    VARCHAR(32),              -- номер по путеводителю музея (B3): перед названием в каталоге
     name              VARCHAR(255) NOT NULL,
-    year_created      INT,
+    year_created      INT,               -- нижняя граница датировки; полный текст — в dating
     master_name       VARCHAR(255),
     material          VARCHAR(255),
+    -- Датировка строкой как в путеводителе: «1899–1903», «1880-е», «конец XIX — начало XX века».
+    -- year_created (INT) хранит только нижнюю границу и пуст у вековых датировок, поэтому
+    -- диапазон без этой колонки терялся (баг-репорт 12.08.2026, п.5).
+    dating            TEXT,
+    -- Техники (хвост каталожной строки после «;»): «штамп, чеканка, эмаль по гильошированному фону».
+    -- Отдельно от material, чтобы «акварель» и «чеканка» не значились материалами (там же, п.5).
+    techniques        TEXT,
     short_description TEXT,
     short_description_spoken TEXT,              -- версия short_description для TTS: числа прописью в нужном падеже (LLM)
     raw_history       TEXT,                     -- внутренние факты для YandexGPT
@@ -121,6 +128,14 @@ CREATE TABLE IF NOT EXISTS exhibits (
 ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS short_description_spoken TEXT;
 ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS exhibit_number VARCHAR(32);
 ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS video_url TEXT;
+ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS dating TEXT;
+ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS techniques TEXT;
+-- dating/techniques в search_vector НЕ входят — как и material, и year_created: вектор
+-- покрывает прозу (name/master_name/short_description/raw_history). Если однажды понадобится
+-- их проиндексировать, ADD COLUMN IF NOT EXISTS выражение уже созданной GENERATED-колонки
+-- молча НЕ поменяет — нужен ALTER COLUMN ... SET EXPRESSION (PG17) либо DROP+ADD с
+-- пересозданием idx_exhibits_search, и правка всех трёх копий выражения (здесь, в CREATE
+-- TABLE выше и в app/models.py::_EXHIBIT_TSV).
 ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS search_vector tsvector GENERATED ALWAYS AS (
     setweight(to_tsvector('russian', coalesce(name,'')), 'A') ||
     setweight(to_tsvector('russian', coalesce(master_name,'') || ' ' || coalesce(exhibit_number,'')), 'B') ||

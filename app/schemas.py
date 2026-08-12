@@ -108,6 +108,10 @@ class ExhibitSummary(BaseModel):
     label_slug: Optional[str] = None
     name: str
     year_created: Optional[int] = None
+    # Датировка как в путеводителе. year_created — нижняя граница диапазона и null у вековых
+    # датировок, поэтому в списке каталога показывать надо dating, если он заполнен: иначе
+    # «1899–1903» выглядит как «1899», а «конец XIX века» — как пустота (12.08.2026, п.5).
+    dating: Optional[str] = None
     master_name: Optional[str] = None
     thumbnail_url: Optional[str] = None
     hall_id: Optional[int] = None
@@ -128,6 +132,8 @@ class Exhibit(BaseModel):
     year_created: Optional[int] = None
     master_name: Optional[str] = None
     material: Optional[str] = None
+    dating: Optional[str] = None      # датировка строкой как в путеводителе («1899–1903»)
+    techniques: Optional[str] = None  # техники из хвоста каталожной строки (после «;»)
     short_description: Optional[str] = None
     image_url: Optional[str] = None
     images: List[Image] = Field(default_factory=list)
@@ -398,6 +404,8 @@ class ExhibitCreate(BaseModel):
     year_created: Optional[int] = None
     master_name: Optional[str] = None
     material: Optional[str] = None
+    dating: Optional[str] = None
+    techniques: Optional[str] = None
     short_description: Optional[str] = None
     # Ручное переопределение озвучки (числа прописью). Если не передан —
     # бэкенд сгенерирует его из short_description через LLM (E15).
@@ -420,6 +428,8 @@ class ExhibitPatch(BaseModel):
     year_created: Optional[int] = None
     master_name: Optional[str] = None
     material: Optional[str] = None
+    dating: Optional[str] = None
+    techniques: Optional[str] = None
     short_description: Optional[str] = None
     short_description_spoken: Optional[str] = None
     raw_history: Optional[str] = None

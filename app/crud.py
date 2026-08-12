@@ -63,6 +63,7 @@ def to_exhibit_summary(e: m.Exhibit) -> sch.ExhibitSummary:
         label_slug=e.label_slug,
         name=e.name,
         year_created=e.year_created,
+        dating=e.dating,
         master_name=e.master_name,
         thumbnail_url=e.image_url,
         hall_id=hall.id if hall else None,
@@ -88,6 +89,8 @@ def to_exhibit(e: m.Exhibit, admin: bool = False) -> sch.Exhibit:
         year_created=e.year_created,
         master_name=e.master_name,
         material=e.material,
+        dating=e.dating,
+        techniques=e.techniques,
         short_description=e.short_description,
         image_url=e.image_url,
         images=images,
@@ -114,6 +117,8 @@ def exhibit_to_dict(e: m.Exhibit) -> Dict:
         "year_created": e.year_created,
         "master_name": e.master_name,
         "material": e.material,
+        "dating": e.dating,
+        "techniques": e.techniques,
         "short_description": e.short_description,
         "raw_history": e.raw_history,
     }
@@ -488,7 +493,17 @@ async def search_exhibits_orm(session: AsyncSession, q: str, limit: int) -> List
     return list((await session.execute(stmt)).scalars().all())
 
 
-async def search_halls_orm(session: AsyncSession, q: str, limit: int) -> List[m.Hall]:
+async def search_halls_orm(
+    session: AsyncSession, q: str, limit: int, include_service: bool = False
+) -> List[m.Hall]:
+    """ORM-залы по запросу: FTS-ранжирование + ILIKE-подстрока.
+
+    Служебные залы (Парадная лестница) по умолчанию скрыты — как в /halls, /map и
+    у гида: это была единственная выборка залов без фильтра видимости, и поиск
+    отдавал посетителю зал, которого нет в списке залов (баг-репорт 12.08.2026;
+    на проде GET /search?q=Парадная лестница возвращал зал 1). Флаг include_service
+    оставлен для админских сценариев, где служебные записи нужно видеть.
+    """
     tsq = _ru_tsquery(q)
     stmt = (
         select(m.Hall)
@@ -496,6 +511,7 @@ async def search_halls_orm(session: AsyncSession, q: str, limit: int) -> List[m.
         .order_by(func.ts_rank(m.Hall.search_vector, tsq).desc(), nullslast(m.Hall.hall_number.asc()))
         .limit(limit)
     )
+    stmt = _hall_visibility(stmt, None, include_service)
     return list((await session.execute(stmt)).scalars().all())
 
 
