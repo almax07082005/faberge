@@ -91,13 +91,13 @@ CREATE TABLE IF NOT EXISTS exhibits (
     label_slug        VARCHAR(100) UNIQUE,      -- класс, который возвращает YOLO
     exhibit_number    VARCHAR(32),              -- номер по путеводителю музея (B3): перед названием в каталоге
     name              VARCHAR(255) NOT NULL,
-    year_created      INT,               -- нижняя граница датировки; полный текст — в dating
+    -- Датировка строкой, дословно как в путеводителе: «1899–1903», «1880-е»,
+    -- «конец XIX — начало XX века». До 17.08.2026 — INT (нижняя граница) в паре
+    -- с колонкой-дублем dating; теперь поле датировки одно (таска 17.08.2026,
+    -- миграция 2026-08-17_year_created_text.sql).
+    year_created      TEXT,
     master_name       VARCHAR(255),
     material          VARCHAR(255),
-    -- Датировка строкой как в путеводителе: «1899–1903», «1880-е», «конец XIX — начало XX века».
-    -- year_created (INT) хранит только нижнюю границу и пуст у вековых датировок, поэтому
-    -- диапазон без этой колонки терялся (баг-репорт 12.08.2026, п.5).
-    dating            TEXT,
     -- Техники (хвост каталожной строки после «;»): «штамп, чеканка, эмаль по гильошированному фону».
     -- Отдельно от material, чтобы «акварель» и «чеканка» не значились материалами (там же, п.5).
     techniques        TEXT,
@@ -128,9 +128,11 @@ CREATE TABLE IF NOT EXISTS exhibits (
 ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS short_description_spoken TEXT;
 ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS exhibit_number VARCHAR(32);
 ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS video_url TEXT;
-ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS dating TEXT;
 ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS techniques TEXT;
--- dating/techniques в search_vector НЕ входят — как и material, и year_created: вектор
+-- year_created INTEGER → TEXT (+ перенос данных из бывшей колонки dating) для живой БД
+-- делает db/migrations/2026-08-17_year_created_text.sql — идемпотентным ALTER'ом это не
+-- выражается, а на чистой базе колонка сразу TEXT (CREATE TABLE выше).
+-- techniques в search_vector НЕ входит — как и material, и year_created: вектор
 -- покрывает прозу (name/master_name/short_description/raw_history). Если однажды понадобится
 -- их проиндексировать, ADD COLUMN IF NOT EXISTS выражение уже созданной GENERATED-колонки
 -- молча НЕ поменяет — нужен ALTER COLUMN ... SET EXPRESSION (PG17) либо DROP+ADD с

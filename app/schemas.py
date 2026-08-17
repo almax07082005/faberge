@@ -4,9 +4,16 @@ from __future__ import annotations
 import enum
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Literal, Optional
+from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+
+
+# Датировка экспоната — строка как в путеводителе («1899–1903», «конец XIX века»).
+# До 17.08.2026 поле было числом; int принимаем и приводим к строке, чтобы старые
+# клиенты (фронт до обновления типов, разовые скрипты) не ловили 422 на переходе.
+# Никакой валидации «это должен быть год» нет сознательно — датировка бывает любой.
+YearCreated = Annotated[Optional[str], BeforeValidator(lambda v: str(v) if isinstance(v, int) else v)]
 
 
 # ── Система ──────────────────────────────────────────────────────────────────
@@ -107,11 +114,10 @@ class ExhibitSummary(BaseModel):
     exhibit_number: Optional[str] = None  # номер по путеводителю музея (B3): перед названием
     label_slug: Optional[str] = None
     name: str
-    year_created: Optional[int] = None
-    # Датировка как в путеводителе. year_created — нижняя граница диапазона и null у вековых
-    # датировок, поэтому в списке каталога показывать надо dating, если он заполнен: иначе
-    # «1899–1903» выглядит как «1899», а «конец XIX века» — как пустота (12.08.2026, п.5).
-    dating: Optional[str] = None
+    # Датировка строкой как в путеводителе («1899–1903», «конец XIX века») — её и
+    # показываем под названием. Раньше рядом жил дубль dating, а year_created был
+    # числом-огрызком (нижняя граница); с 17.08.2026 поле датировки одно.
+    year_created: YearCreated = None
     master_name: Optional[str] = None
     thumbnail_url: Optional[str] = None
     hall_id: Optional[int] = None
@@ -129,10 +135,9 @@ class Exhibit(BaseModel):
     exhibit_number: Optional[str] = None  # номер по путеводителю музея (B3)
     label_slug: Optional[str] = None
     name: str
-    year_created: Optional[int] = None
+    year_created: YearCreated = None  # датировка строкой как в путеводителе («1899–1903»)
     master_name: Optional[str] = None
     material: Optional[str] = None
-    dating: Optional[str] = None      # датировка строкой как в путеводителе («1899–1903»)
     techniques: Optional[str] = None  # техники из хвоста каталожной строки (после «;»)
     short_description: Optional[str] = None
     image_url: Optional[str] = None
@@ -401,10 +406,11 @@ class ExhibitCreate(BaseModel):
     exhibit_number: Optional[str] = None  # номер по путеводителю музея (B3)
     label_slug: Optional[str] = None
     name: str
-    year_created: Optional[int] = None
+    # Датировка как в путеводителе, без валидации формата: «1899–1903» и
+    # «конец XIX века» сохраняются как есть (таска 17.08.2026).
+    year_created: YearCreated = None
     master_name: Optional[str] = None
     material: Optional[str] = None
-    dating: Optional[str] = None
     techniques: Optional[str] = None
     short_description: Optional[str] = None
     # Ручное переопределение озвучки (числа прописью). Если не передан —
@@ -425,10 +431,9 @@ class ExhibitPatch(BaseModel):
     exhibit_number: Optional[str] = None
     label_slug: Optional[str] = None
     name: Optional[str] = None
-    year_created: Optional[int] = None
+    year_created: YearCreated = None
     master_name: Optional[str] = None
     material: Optional[str] = None
-    dating: Optional[str] = None
     techniques: Optional[str] = None
     short_description: Optional[str] = None
     short_description_spoken: Optional[str] = None

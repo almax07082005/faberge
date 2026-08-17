@@ -97,23 +97,20 @@ async def chat(
 # ── Стаб ─────────────────────────────────────────────────────────────────────
 def _story_stub(exhibit: Dict, style: str) -> str:
     name = exhibit.get("name", "экспонат")
-    year = exhibit.get("year_created")
-    dating = (exhibit.get("dating") or "").strip()
+    dating = (exhibit.get("year_created") or "").strip()
     master = exhibit.get("master_name")
     material = exhibit.get("material")
     techniques = (exhibit.get("techniques") or "").strip()
     short = exhibit.get("short_description")
     raw = exhibit.get("raw_history")
 
-    # Датировку берём из dating, а year_created оставляем запасным вариантом: он держит
-    # только НИЖНЮЮ границу и пуст у вековых датировок, поэтому гид говорил «созданное
-    # в 1899 году» там, где в путеводителе «1899–1903», а на «конец XIX века» умалчивал
-    # о времени вовсе (баг-репорт 12.08.2026, п.5). Сама dating приходит именительной
-    # фразой («около 1912», «конец XIX — начало XX века»), в оборот «созданное в … году»
-    # её не поставить — поэтому вводная строится как подпись на музейной этикетке,
-    # перечислением через запятую. По той же причине не склоняем и мастера: в поле
-    # лежат и люди («Михаил Перхин»), и фирмы («Фирма К. Фаберже»).
-    label = [f for f in (dating or (f"{year} год" if year else ""), master) if f]
+    # year_created — датировка строкой как в путеводителе (с 17.08.2026 поле датировки
+    # одно). Она приходит именительной фразой («около 1912», «конец XIX — начало XX
+    # века»), в оборот «созданное в … году» её не поставить — поэтому вводная строится
+    # как подпись на музейной этикетке, перечислением через запятую. По той же причине
+    # не склоняем и мастера: в поле лежат и люди («Михаил Перхин»), и фирмы
+    # («Фирма К. Фаберже»).
+    label = [f for f in (dating, master) if f]
     intro = f"Перед вами {name}"
     if label:
         intro += ", " + ", ".join(label)
@@ -187,14 +184,12 @@ async def _yandexgpt_complete(system: str, user: str, temperature: float = 0.6, 
 
 async def _yandexgpt_story(exhibit: Dict, style: str, language: str) -> str:
     # Промпт из роадмапа. «Год» в нём заменён на «датировку»: раньше в промпт уходил
-    # year_created — нижняя граница диапазона, — и модель уверенно писала «созданное
-    # в 1899 году» про предмет, датированный «1899–1903», а у вековых датировок
-    # получала «год: None» и придумывала дату сама (баг-репорт 12.08.2026, п.5).
-    # Отдаём строку путеводителя как есть, year_created — только если dating пуст.
+    # числовой year_created — нижняя граница диапазона, — и модель уверенно писала
+    # «созданное в 1899 году» про предмет, датированный «1899–1903», а у вековых
+    # датировок получала «год: None» и придумывала дату сама (баг-репорт 12.08.2026,
+    # п.5). Теперь year_created и есть строка путеводителя — отдаём её как есть.
     raw = exhibit.get("raw_history") or exhibit.get("short_description") or ""
-    dating = (exhibit.get("dating") or "").strip() or (
-        str(exhibit["year_created"]) if exhibit.get("year_created") else ""
-    )
+    dating = (exhibit.get("year_created") or "").strip()
     techniques = (exhibit.get("techniques") or "").strip()
     user = (
         f"Напиши интересную историю для посетителя музея, используя данные: {raw}, "

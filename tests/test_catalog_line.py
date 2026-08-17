@@ -694,8 +694,8 @@ def _mismatches(case: Case):
         errors.append(f"status: ждали {case.status}, получили {got.status}")
     for title, expected, actual in (
         ("origin_place", case.place, got.origin_place),
-        ("dating", case.dating, got.dating),
-        ("year_created", case.year, got.year_created),
+        ("year_created", case.dating, got.year_created),
+        ("year_lower", case.year, got.year_lower),
         ("master_name", case.master, got.master_name),
         ("material", case.material, got.material),
         ("techniques", case.techniques, got.techniques),
@@ -800,7 +800,7 @@ def test_abbreviation_ok_does_not_split_dating():
     """«ок. 1700» (id 632): точка сокращения — не конец сегмента."""
     line = parse_catalog_line("Голландия, Амстердам, ок. 1700. Неизвестный мастер. "
                               "Дуб, орех; резьба")
-    assert (line.dating, line.year_created, line.precision) == ("ок. 1700", 1700, "circa")
+    assert (line.year_created, line.year_lower, line.precision) == ("ок. 1700", 1700, "circa")
     assert line.origin_place == "Голландия, Амстердам"
     # Сама карточка id 632 всё равно не разбирается: «Я. Роохальс, И. Хоогебоом» — авторы
     # без ключевого слова, и молча счесть их местом нельзя (проверено в CASES).
@@ -810,43 +810,44 @@ def test_reversed_range_is_reported_not_fixed():
     """id 483 «1897−1809»: опечатка указателя. Год берём левый, годы местами НЕ меняем."""
     line = parse_catalog_line("Санкт-Петербург, 1897−1809. Мастер О. Кейбель. "
                               "Золото, металл, стекло, масло; гравировка, гильошировка")
-    assert (line.dating, line.year_created) == ("1897−1809", 1897)
+    assert (line.year_created, line.year_lower) == ("1897−1809", 1897)
     assert any("перевёрнутый" in note for note in line.notes), line.notes
 
 
 def test_cyrillic_century_is_recognised_but_kept_verbatim():
     """id 1151 и 652: «ХХ век» набрано кириллическими «Х».
 
-    Гомоглиф чиним только для распознавания — в ``dating`` датировка обязана остаться
-    дословно такой, как в путеводителе, иначе поле перестанет совпадать с источником.
+    Гомоглиф чиним только для распознавания — в ``year_created`` датировка обязана
+    остаться дословно такой, как в путеводителе, иначе поле перестанет совпадать
+    с источником.
     """
     icon = parse_catalog_line("Живопись: Москва, ХХ век. Дерево, масло. "
                               "Оклад: Москва, XX век. Серебро; штамп, эмаль по скани, позолота")
-    assert icon.dating == "ХХ век" and "Х" in icon.dating      # кириллическая «Х»
-    assert (icon.year_created, icon.precision) == (None, "century")
+    assert icon.year_created == "ХХ век" and "Х" in icon.year_created      # кириллическая «Х»
+    assert (icon.year_lower, icon.precision) == (None, "century")
 
     cufflinks = parse_catalog_line("Россия, начало ХХ века. Неизвестный мастер. "
                                    "Золото, штамп, токарно-давильные работы, "
                                    "эмаль по гильошированному фону")
-    assert cufflinks.dating == "начало ХХ века"
-    assert cufflinks.year_created is None
+    assert cufflinks.year_created == "начало ХХ века"
+    assert cufflinks.year_lower is None
     # Латинская «e» в «1770-e» (id 656) — тот же приём с другой стороны.
     snuffbox = parse_catalog_line("Швейцария, Женева, 1770-e. Неизвестный мастер. "
                                   "Золото; чеканка")
-    assert snuffbox.dating == "1770-e" and snuffbox.dating.endswith("e")   # латинская «e»
-    assert (snuffbox.year_created, snuffbox.precision) == (1770, "decade")
+    assert snuffbox.year_created == "1770-e" and snuffbox.year_created.endswith("e")  # латинская «e»
+    assert (snuffbox.year_lower, snuffbox.precision) == (1770, "decade")
 
 
 def test_every_dash_flavour_is_the_same_dash():
     """В диапазонах лет на проде четыре разных знака — для парсера они эквивалентны."""
     for dash in ("–", "−", "-", "—"):
         line = parse_catalog_line(f"Москва, 1899{dash}1903. Фирма К. Фаберже. Серебро; чеканка")
-        assert (line.year_created, line.precision) == (1899, "range"), dash
-        assert line.dating == f"1899{dash}1903", dash
+        assert (line.year_lower, line.precision) == (1899, "range"), dash
+        assert line.year_created == f"1899{dash}1903", dash
 
 
 def test_dating_precision_ladder():
-    """Восемь видов точности датировки: year_created — всегда НИЖНЯЯ граница."""
+    """Восемь видов точности датировки: year_lower — всегда НИЖНЯЯ граница."""
     samples = (
         ("1911", 1911, "exact"),
         ("1899–1903", 1899, "range"),
@@ -869,7 +870,7 @@ def test_dating_precision_ladder():
     )
     for dating, year, precision in samples:
         line = parse_catalog_line(f"Москва, {dating}. Фирма К. Фаберже. Серебро; чеканка")
-        assert (line.dating, line.year_created, line.precision) == (dating, year, precision), dating
+        assert (line.year_created, line.year_lower, line.precision) == (dating, year, precision), dating
 
 
 def test_multipart_card_takes_first_object_part():
@@ -883,7 +884,7 @@ def test_multipart_card_takes_first_object_part():
         "гравировка, эмаль по гильошированному фону, выемчатая эмаль, монтировка"
     )
     assert line.material == "Золото, Алмазы-«розы», Сапфир"
-    assert line.dating == "1887–1899"
+    assert line.year_created == "1887–1899"
     assert all(label in " ".join(line.notes) for label in ("Портсигар", "Брошь", "Кулон"))
 
 
@@ -980,7 +981,7 @@ def test_partial_when_only_a_secondary_part_is_broken():
         "Оклад: Москва, 1899–1908. Я. Роохальс, И. Хоогебоом. Серебро; чеканка, золочение"
     )
     assert line.status == STATUS_PARTIAL
-    assert (line.material, line.dating) == ("Металл, Масло", "1899–1908")
+    assert (line.material, line.year_created) == ("Металл, Масло", "1899–1908")
     assert any("часть «Оклад» не разобрана" in note for note in line.notes), line.notes
 
 
@@ -990,7 +991,7 @@ def test_skipped_leaves_every_field_empty():
         if case.status != STATUS_SKIPPED:
             continue
         line = parse_catalog_line(case.text)
-        assert (line.year_created, line.dating, line.master_name, line.material,
+        assert (line.year_created, line.year_lower, line.master_name, line.material,
                 line.techniques, line.origin_place, line.provenance, line.precision) == (
             None, None, None, None, None, None, None, None), case.exhibit_id
         assert line.notes, f"id={case.exhibit_id}: пропуск без объяснения — нечего показать в отчёте"
@@ -1032,7 +1033,7 @@ def test_regnal_number_before_dot_ends_the_sentence():
         "Фирма К. Фаберже, мастер Г. Вигстрём. Золото, рубины; чеканка"
     )
     assert line.origin_place == "Санкт-Петербург"
-    assert (line.dating, line.year_created) == ("1903–1904", 1903)
+    assert (line.year_created, line.year_lower) == ("1903–1904", 1903)
     # А монограмма в кавычках инициалы сохраняет: «Мастер-монограммист «I. N.»».
     monogram = parse_catalog_line(
         "Санкт-Петербург, 1908–1917. Мастер-монограммист «I. N.». Серебро; штамп, гравировка"
@@ -1046,7 +1047,7 @@ def test_numeral_is_a_maker_only_with_the_word_artel():
     assert artel.master_name == "Первая серебряная артель"
     half = parse_catalog_line("Москва, первая половина XIX века. Серебро; чеканка")
     assert half.master_name is None
-    assert half.dating == "первая половина XIX века"
+    assert half.year_created == "первая половина XIX века"
 
 
 if __name__ == "__main__":

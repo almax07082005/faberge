@@ -105,12 +105,12 @@ class Exhibit(Base):
     # каталоге. Строка (а не INT), т.к. в путеводителе встречаются номера вида «12а».
     exhibit_number: Mapped[Optional[str]] = mapped_column(String(32))
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    year_created: Mapped[Optional[int]] = mapped_column(Integer)
+    # Датировка строкой, дословно как в путеводителе: «1899–1903», «1880-е»,
+    # «конец XIX — начало XX века». До 17.08.2026 поле было INT (нижняя граница
+    # диапазона) и жило в паре с dating; теперь поле датировки одно (таска 17.08.2026).
+    year_created: Mapped[Optional[str]] = mapped_column(Text)
     master_name: Mapped[Optional[str]] = mapped_column(String(255))
     material: Mapped[Optional[str]] = mapped_column(String(255))
-    # Датировка как в путеводителе («1899–1903», «конец XIX — начало XX века»): year_created
-    # выше — INT и держит только нижнюю границу, а у вековых датировок пуст (12.08.2026, п.5).
-    dating: Mapped[Optional[str]] = mapped_column(Text)
     # Техники из хвоста каталожной строки (после «;») — отдельно от материалов.
     techniques: Mapped[Optional[str]] = mapped_column(Text)
     short_description: Mapped[Optional[str]] = mapped_column(Text)

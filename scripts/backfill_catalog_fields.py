@@ -111,11 +111,12 @@ UA = "faberge-catalog-backfill/1.0"
 
 # Поля, которые бэкфилл дозаполняет. Имена колонок совпадают с именами полей ``ParsedLine``,
 # поэтому отдельной таблицы соответствий не нужно — берём через getattr.
-# ``origin_place`` и ``provenance`` парсер тоже отдаёт, но колонок под них нет: они идут
+# ``year_created`` — датировка СТРОКОЙ дословно («1899–1903», «конец XIX века»): с 17.08.2026
+# колонка TEXT и поле датировки одно (прежний дубль dating выпилен). ``year_lower`` и
+# ``origin_place``/``provenance`` парсер тоже отдаёт, но колонок под них нет: они идут
 # только в отчёт, чтобы заказчик глазом видел, ТУ ЛИ строку разобрал парсер.
 FIELD_TITLES: "OrderedDict[str, str]" = OrderedDict((
-    ("year_created", "год"),
-    ("dating", "датировка"),
+    ("year_created", "датировка"),
     ("master_name", "мастер"),
     ("material", "материалы"),
     ("techniques", "техники"),
@@ -142,7 +143,7 @@ PRECISION_TITLES: "OrderedDict[str, str]" = OrderedDict((
     (PRECISION_CIRCA, "около"),
     (PRECISION_BEFORE, "не позднее"),
     (PRECISION_AFTER, "после"),
-    (PRECISION_CENTURY, "век — года нет, year_created пуст"),
+    (PRECISION_CENTURY, "век — арабского года в датировке нет"),
     (PRECISION_NONE, "датировки в строке нет"),
 ))
 

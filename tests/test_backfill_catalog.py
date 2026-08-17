@@ -37,8 +37,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 
 import backfill_catalog_fields as backfill  # noqa: E402
 
-# Реальные строки с прода: A1 (74 % каталога), A2 (без мастера) и вековая датировка,
-# у которой year_created обязан остаться пустым.
+# Реальные строки с прода: A1 (74 % каталога), A2 (без мастера) и вековая датировка —
+# с 17.08.2026 year_created хранит датировку строкой, и вековая пишется дословно.
 LINE_A1 = ("Санкт-Петербург, 1899–1903. Фирма К. Фаберже, мастер М. Перхин. "
            "Золото, серебро, сталь, сапфир; штамп, чеканка, гравировка, золочение")
 LINE_A2 = ("Санкт-Петербург, 1908−1917. Серебро; выемчатая эмаль, живопись по эмали, "
@@ -54,7 +54,7 @@ class FakeApi:
     """Каталог в памяти: залы → экспонаты. Умеет ровно те ручки, что дёргает бэкфилл."""
 
     # Поля ExhibitSummary: описания, материалов и техник в списочной выдаче НЕТ.
-    SUMMARY = ("id", "exhibit_number", "name", "year_created", "dating", "master_name",
+    SUMMARY = ("id", "exhibit_number", "name", "year_created", "master_name",
                "hall_id", "showcase_id", "showcase_number")
 
     def __init__(self, halls, exhibits) -> None:
@@ -114,7 +114,7 @@ def card(ex_id: int, name: str, line=None, hall_id: int = 6, **fields) -> dict:
     base = {
         "id": ex_id, "name": name, "hall_id": hall_id, "exhibit_number": None,
         "showcase_id": 20, "showcase_number": 1, "short_description": line,
-        "year_created": None, "dating": None, "master_name": None,
+        "year_created": None, "master_name": None,
         "material": None, "techniques": None,
     }
     base.update(fields)
@@ -153,24 +153,23 @@ def test_empty_fields_are_filled_from_the_catalog_line():
     fake = catalog(card(532, "Пасхальное яйцо", LINE_A1))
     run_backfill(fake, apply=True)
     ex = fake.exhibits[532]
-    assert ex["year_created"] == 1899                      # нижняя граница диапазона
-    assert ex["dating"] == "1899–1903"                     # датировка дословно как в указателе
+    assert ex["year_created"] == "1899–1903"               # датировка дословно как в указателе
     assert ex["master_name"] == "Фирма К. Фаберже, мастер М. Перхин"
     assert ex["material"] == "Золото, Серебро, Сталь, Сапфир"
     assert ex["techniques"] == "штамп, чеканка, гравировка, золочение"
     assert ex["short_description"] == LINE_A1              # источник не тронут
 
 
-def test_century_dating_leaves_year_empty_but_fills_dating():
-    """«вторая половина XVI века» в число не превращаем: 1501 сломал бы сортировку сильнее пустого."""
+def test_century_dating_is_written_verbatim():
+    """«вторая половина XVI века» пишется в year_created дословно: поле — строка датировки,
+    в число её больше никто не превращает."""
     fake = catalog(card(1222, "Икона", LINE_CENTURY))
     _, printed = run_backfill(fake, apply=True)
     ex = fake.exhibits[1222]
-    assert ex["year_created"] is None
-    assert ex["dating"] == "вторая половина XVI века"
+    assert ex["year_created"] == "вторая половина XVI века"
     assert ex["material"] == "Дерево, Левкас, Темпера"
     assert ex["techniques"] is None                        # техник в строке нет — поле не трогаем
-    assert "век — года нет" in printed                     # видно в распределении точности
+    assert "век — арабского года" in printed               # видно в распределении точности
 
 
 def test_missing_maker_segment_is_not_invented():
@@ -179,26 +178,26 @@ def test_missing_maker_segment_is_not_invented():
     run_backfill(fake, apply=True)
     ex = fake.exhibits[459]
     assert ex["master_name"] is None
-    assert (ex["year_created"], ex["material"]) == (1908, "Серебро")
+    assert (ex["year_created"], ex["material"]) == ("1908−1917", "Серебро")
 
 
 def test_only_empty_fields_are_patched():
     """Патч несёт ровно недостающие поля: заполненные в запрос не попадают вовсе."""
     fake = catalog(card(532, "Пасхальное яйцо", LINE_A1,
-                        year_created=1901, material="Золото, Серебро"))
+                        year_created="1901", material="Золото, Серебро"))
     run_backfill(fake, apply=True)
     body = fake.patches()[0][1]
-    assert set(body) == {"dating", "master_name", "techniques"}
+    assert set(body) == {"master_name", "techniques"}
 
 
 # ── Непустое не перезаписываем ──────────────────────────────────────────────────────────────
 def test_manual_values_are_never_overwritten():
     """Ручные правки музея и фронта разбор указателя не трогает — только показывает расхождение."""
     fake = catalog(card(532, "Пасхальное яйцо", LINE_A1,
-                        year_created=1904, master_name="Август Хольмстрём"))
+                        year_created="1904", master_name="Август Хольмстрём"))
     _, printed = run_backfill(fake, apply=True)
     ex = fake.exhibits[532]
-    assert ex["year_created"] == 1904                      # год музея на месте
+    assert ex["year_created"] == "1904"                    # датировка музея на месте
     assert ex["master_name"] == "Август Хольмстрём"        # мастер музея на месте
     assert "Расходится с каталожной строкой" in printed
     assert "Август Хольмстрём" in printed and "Фирма К. Фаберже" in printed
@@ -244,7 +243,7 @@ def test_dry_run_sends_no_patch():
     assert fake.patches() == []
     assert fake.snapshot() == before
     assert "Это сухой прогон" in printed
-    assert "Правок: 5" in printed                          # но план ровно тот, что применится
+    assert "Правок: 4" in printed                          # но план ровно тот, что применится
 
 
 def test_dry_run_plan_equals_what_apply_writes():
@@ -282,7 +281,7 @@ def test_card_without_description_is_not_a_parse_failure():
 # ── Откат ───────────────────────────────────────────────────────────────────────────────────
 def test_rollback_restores_original_values():
     """Откат возвращает ровно исходные значения, включая NULL у незаполненных полей."""
-    fake = catalog(card(532, "Пасхальное яйцо", LINE_A1, year_created=1904))
+    fake = catalog(card(532, "Пасхальное яйцо", LINE_A1, year_created="1904"))
     before = fake.snapshot()
     path = os.path.join(tempfile.mkdtemp(), "rollback.json")
     run_backfill(fake, apply=True, rollback_file=path)
@@ -303,7 +302,7 @@ def test_rollback_is_repeatable_and_spares_hand_edits():
     _, printed = run_backfill(fake, rollback=path, apply=True)
     assert fake.exhibits[532]["master_name"] == "Мастер М. Перхин"
     assert "значение правили после прогона" in printed
-    assert fake.exhibits[532]["dating"] is None            # остальное откатилось
+    assert fake.exhibits[532]["year_created"] is None      # остальное откатилось
 
     _, printed = run_backfill(fake, rollback=path, apply=True)
     assert "Возвращено карточек: 0" in printed
@@ -382,7 +381,7 @@ def test_service_hall_is_in_scope_and_report_is_grouped_by_hall():
         [card(458, "Бюсты", LINE_A1, hall_id=1), card(532, "Пасхальное яйцо", LINE_A2, hall_id=6)],
     )
     _, printed = run_backfill(fake, apply=True)
-    assert fake.exhibits[458]["year_created"] == 1899
+    assert fake.exhibits[458]["year_created"] == "1899–1903"
     assert "зал 1 — 1" in printed and "зал 6 — 1" in printed
 
 
@@ -391,8 +390,8 @@ def test_ids_mode_reads_the_card_directly():
     fake = catalog(card(532, "Пасхальное яйцо", LINE_A1), card(459, "Ковш", LINE_A2))
     run_backfill(fake, apply=True, ids="532")
     assert not any(path.startswith("/halls") for _, path, _ in fake.calls)
-    assert fake.exhibits[532]["dating"] == "1899–1903"
-    assert fake.exhibits[459]["dating"] is None
+    assert fake.exhibits[532]["year_created"] == "1899–1903"
+    assert fake.exhibits[459]["year_created"] is None
 
 
 def test_report_file_lists_changes_conflicts_and_skips():
@@ -403,7 +402,7 @@ def test_report_file_lists_changes_conflicts_and_skips():
     run_backfill(fake, report_file=path)
     with open(path, encoding="utf-8") as fh:
         doc = json.load(fh)
-    assert doc["summary"]["changes"] == 4                   # мастера не трогали
+    assert doc["summary"]["changes"] == 3                   # мастера не трогали
     assert [c["exhibit_id"] for c in doc["conflicts"]] == [532]
     assert [s["exhibit_id"] for s in doc["skipped"]] == [48]
 

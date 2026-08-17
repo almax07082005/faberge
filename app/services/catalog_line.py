@@ -23,12 +23,12 @@
 * **Точка — не всегда конец сегмента.** «Мастерская Дж. Бриджа» (id 633) и «ок. 1700»
   (id 632) наивный сплит по «. » режет пополам. Инициалы (1–2 заглавные буквы) и
   сокращения из ``_ABBREVIATIONS`` границей не считаются.
-* **Век в число не превращаем.** «конец XIX века» → ``year_created=None`` и
-  ``precision='century'``: превратив его в 1801, мы бы сломали сортировку и фильтры
-  сильнее, чем пустое поле. ``year_created`` — всегда НИЖНЯЯ граница периода, а
-  ``dating`` хранит датировку дословно, как в путеводителе («1880-е — первая половина
-  1890-х»), включая латинские и кириллические гомоглифы исходника: чинить их нужно для
-  РАСПОЗНАВАНИЯ, а не для показа.
+* **Датировка — строкой, дословно.** ``year_created`` хранит датировку как в
+  путеводителе («1880-е — первая половина 1890-х»), включая латинские и кириллические
+  гомоглифы исходника: чинить их нужно для РАСПОЗНАВАНИЯ, а не для показа. Рядом
+  ``year_lower`` — нижняя граница периода числом («конец XIX века» → ``None`` и
+  ``precision='century'``): в колонку он больше не пишется (с 17.08.2026 колонка
+  ``year_created`` — TEXT), но нужен классификации точности и пометкам разбора.
 * **Молчаливая порча хуже пропуска.** Если в строке остался сегмент, который парсер не
   опознал, карточка получает ``status='skipped'`` и ВСЕ поля ``None`` — пусть лучше
   останется пустой и попадёт в отчёт, чем в ``master_name`` уедет половина датировки.
@@ -48,6 +48,7 @@
     line = parse_catalog_line(card["short_description"])
     if line.status != "skipped":
         patch = {"year_created": line.year_created, "material": line.material, ...}
+        # line.year_created — строка датировки целиком («1899–1903», «конец XIX века»)
 """
 from __future__ import annotations
 
@@ -159,6 +160,11 @@ PRECISION_CENTURY = "century"
 class ParsedLine:
     """Результат разбора одной каталожной строки.
 
+    ``year_created`` — датировка СТРОКОЙ, дословно как в путеводителе: ровно то, что
+    пишется в одноимённую колонку (TEXT с 17.08.2026). ``year_lower`` — её нижняя
+    граница числом; в колонки не пишется, но нужен классификации точности
+    (``precision``) и пометкам разбора (перевёрнутый диапазон).
+
     ``origin_place`` и ``provenance`` в колонки не пишутся (таких колонок нет) — они
     нужны отчёту заказчику: место и преамбулу-посвящение видно глазом, и по ним сразу
     понятно, ту ли строку разобрал парсер.
@@ -168,8 +174,8 @@ class ParsedLine:
     """
 
     status: str
-    year_created: Optional[int]
-    dating: Optional[str]
+    year_created: Optional[str]
+    year_lower: Optional[int]
     master_name: Optional[str]
     material: Optional[str]
     techniques: Optional[str]
@@ -582,10 +588,10 @@ def _has_date_hint(token: str) -> bool:
 def _parse_dating(text: str) -> Tuple[Optional[int], str, Tuple[str, ...]]:
     """Датировка → (нижняя граница, точность, пометки).
 
-    ``year_created`` — ВСЕГДА нижняя граница периода, то есть ПЕРВЫЙ год строки: «1899–1903»
+    ``year_lower`` — ВСЕГДА нижняя граница периода, то есть ПЕРВЫЙ год строки: «1899–1903»
     → 1899, «1880-е — первая половина 1890-х» → 1880, «не позднее 1899» → 1899. Датировки
     без арабского года («конец XIX века», «рубеж XIX–XX веков») дают ``None``: век в число
-    превращать нельзя, «конец XIX века» стал бы 1801 и сломал сортировку.
+    превращать нельзя, «конец XIX века» стал бы 1801.
     """
     fixed = _repair_homoglyphs(text.strip())
     flat = _DASH_RE.sub("-", fixed).lower()
@@ -797,7 +803,7 @@ def _parse_part(label: Optional[str], body: str, allow_provenance: bool) -> _Par
 def _skipped(*notes: str) -> ParsedLine:
     """Ничего не разобрали: ВСЕ поля None. Карточку бэкфилл не трогает вовсе."""
     return ParsedLine(
-        status=STATUS_SKIPPED, year_created=None, dating=None, master_name=None,
+        status=STATUS_SKIPPED, year_created=None, year_lower=None, master_name=None,
         material=None, techniques=None, origin_place=None, provenance=None,
         precision=None, notes=tuple(notes),
     )
@@ -856,8 +862,8 @@ def _parse_legacy(text: str) -> Optional[ParsedLine]:
         year, precision, date_notes = _parse_dating(year_token)
     return ParsedLine(
         status=STATUS_PARSED,
-        year_created=year,
-        dating=year_token,
+        year_created=year_token,
+        year_lower=year,
         master_name=master,
         material=material,
         techniques=_join_techniques(techniques),
@@ -1001,8 +1007,8 @@ def parse_catalog_line(text: Optional[str]) -> ParsedLine:
         status = STATUS_PARSED
     return ParsedLine(
         status=status,
-        year_created=primary.year,
-        dating=primary.dating,
+        year_created=primary.dating,
+        year_lower=primary.year,
         master_name=primary.master,
         material=material,
         techniques=_join_techniques(primary.techniques),

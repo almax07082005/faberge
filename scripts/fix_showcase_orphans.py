@@ -92,15 +92,14 @@ MEDIA_FIELDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("видео", ("video_url",)),
     ("3D", ("model_3d_url", "model_3d_embed")),
     ("распознавание", ("label_slug",)),
-    # dating/techniques — такие же каталожные данные, как material и year_created (появились
-    # 12.08.2026, п.5: датировка строкой из путеводителя и техники из хвоста каталожной строки).
-    # Без них карточка, у которой разбор импорта заполнил ТОЛЬКО эти два поля, считалась пустой
-    # и удалялась по --delete-ids молча. Именно так выглядят сотни карточек нового импорта:
-    # year_created пуст (вековая датировка), material пуст (в строке одни техники).
+    # techniques — такие же каталожные данные, как material и year_created (12.08.2026, п.5;
+    # с 17.08.2026 year_created — датировка строкой, бывший дубль dating выпилен). Без них
+    # карточка, у которой разбор импорта заполнил ТОЛЬКО такие поля, считалась пустой
+    # и удалялась по --delete-ids молча (например, material пуст — в строке одни техники).
     # Оговорка: techniques отдаётся только админской карточкой (в ExhibitSummary его нет),
     # так что без ADMIN_TOKEN эта метка не посчитается — ровно тот случай, ради которого
     # load_orphan_details возвращает признак «прочитано не всё» и отменяет удаление.
-    ("каталожные поля", ("material", "master_name", "year_created", "dating", "techniques", "source_url")),
+    ("каталожные поля", ("material", "master_name", "year_created", "techniques", "source_url")),
 )
 
 # Что кладём в файл отката по удаляемой карточке. Раньше писались только id/название/витрина —
@@ -109,11 +108,11 @@ MEDIA_FIELDS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
 # карточку можно завести заново руками (POST /admin/exhibits принимает ровно эти поля).
 # Список обязан идти нога в ногу с MEDIA_FIELDS выше: поле, которое блокирует удаление, но не
 # попало в снимок, — это ровно те данные, ради сохранности которых удаление и блокировалось.
-# Поэтому dating/techniques здесь тоже (12.08.2026, п.5).
+# Поэтому techniques здесь тоже (12.08.2026, п.5).
 SNAPSHOT_FIELDS: Tuple[str, ...] = (
     "id", "name", "exhibit_number", "label_slug", "short_description", "short_description_spoken",
     "raw_history", "image_url", "thumbnail_url", "images", "audio_url", "video_url",
-    "model_3d_url", "model_3d_embed", "material", "master_name", "year_created", "dating",
+    "model_3d_url", "model_3d_embed", "material", "master_name", "year_created",
     "techniques", "source_url",
 )
 
