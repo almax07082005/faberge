@@ -1,0 +1,7 @@
+# Собирается scripts/loadtest_prepare.py с живого стенда — не версионируем:
+# id зависят от того, какой seed применён.
+fixtures.json
+fixtures/
+
+# Результаты прогонов.
+artifacts/

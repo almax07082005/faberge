@@ -1,0 +1,21 @@
+{
+  "_": "Пример структуры. Настоящий fixtures.json собирает scripts/loadtest_prepare.py с живого API и не версионируется (id зависят от применённого seed).",
+  "base_url": "http://localhost:8000",
+  "dependencies": {
+    "postgres": "up",
+    "object_storage": "down",
+    "yolo": "down",
+    "yandexgpt": "down",
+    "speechkit": "down"
+  },
+  "halls": [
+    { "id": 1, "hall_number": 1, "name": "Рыцарский зал" },
+    { "id": 2, "hall_number": 2, "name": "Красная гостиная" }
+  ],
+  "exhibits": [
+    { "id": 101, "hall_id": 1, "label_slug": "faberge_egg_coronation", "name": "Коронационное яйцо" },
+    { "id": 102, "hall_id": 2, "label_slug": "faberge_egg_winter", "name": "Зимнее яйцо" }
+  ],
+  "queries": ["Коронационное", "Рыцарский зал", "яйцо"],
+  "questions": ["Расскажи об этом экспонате", "Кто был мастером этого яйца?"]
+}
