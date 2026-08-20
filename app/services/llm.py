@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -66,6 +67,23 @@ def _log_usage(operation: str, model_uri: str, result: Dict) -> None:
         _as_int(usage.get("completionTokens")),
         _as_int(usage.get("totalTokens")),
     )
+
+
+# Ссылка на карточку музея внутри справки — это не факт, а мусор в промпте, и
+# читается моделью буквально. Живой пример с прода (20.08.2026): у портсигара
+# id=144 весь raw_history — «Место создания… Техника… Источник:
+# https://fabergemuseum.ru/…/portcigar-dly-cera-doycona», и рассказ получался
+# «портсигар для царя Дойкона» — несуществующего царя, вычитанного из slug'а
+# URL. Плюс сам URL — оплаченные входные токены ни за что.
+_SOURCE_RE = re.compile(r"(?:^|[;.,]\s*)Источник:\s*\S+", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _strip_sources(text: Optional[str]) -> str:
+    """Убрать из справки ссылки-источники перед отправкой в модель."""
+    cleaned = _URL_RE.sub("", _SOURCE_RE.sub("", text or ""))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.rstrip(" ;,").strip()
 
 
 def _shorten(text: str, limit: int) -> str:
@@ -286,7 +304,7 @@ async def _yandexgpt_story(exhibit: Dict, style: str, language: str) -> str:
     # «созданное в 1899 году» про предмет, датированный «1899–1903», а у вековых
     # датировок получала «год: None» и придумывала дату сама (баг-репорт 12.08.2026,
     # п.5). Теперь year_created и есть строка путеводителя — отдаём её как есть.
-    raw = exhibit.get("raw_history") or exhibit.get("short_description") or ""
+    raw = _strip_sources(exhibit.get("raw_history") or exhibit.get("short_description") or "")
     dating = (exhibit.get("year_created") or "").strip()
     techniques = (exhibit.get("techniques") or "").strip()
     user = (
@@ -349,7 +367,7 @@ async def _yandexgpt_chat(grounding: str, history: List[Tuple[str, str]], messag
     turns = max(0, settings.guide_history_turns)
     convo = "\n".join(f"{r}: {c}" for r, c in (history[-turns:] if turns else []))
     parts = []
-    grounding = _shorten(grounding, settings.guide_grounding_max_chars)
+    grounding = _shorten(_strip_sources(grounding), settings.guide_grounding_max_chars)
     if grounding:
         parts.append(f"Справка о текущем месте посетителя (может быть не связана с вопросом): {grounding}")
     if convo:
@@ -361,7 +379,7 @@ async def _yandexgpt_chat(grounding: str, history: List[Tuple[str, str]], messag
 async def _yandexgpt_questions(exhibit: Dict, max_questions: int, language: str) -> List[str]:
     if max_questions <= 0:
         return []
-    raw = exhibit.get("raw_history") or exhibit.get("short_description") or exhibit.get("name", "")
+    raw = _strip_sources(exhibit.get("raw_history") or exhibit.get("short_description") or exhibit.get("name", ""))
     user = (
         f"На основе данных об экспонате ({raw}) предложи {max_questions} коротких вопроса, "
         "которые посетитель захотел бы задать гиду. Каждый вопрос с новой строки, без нумерации."

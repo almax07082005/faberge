@@ -160,6 +160,26 @@ def test_chat_shortens_grounding():
     assert len(sent) <= 700 and sent.endswith(".")
 
 
+def test_source_urls_never_reach_the_model():
+    """Ссылка из справки читается моделью как факт — вырезаем её до промпта.
+
+    Живой случай с прода: у портсигара id=144 весь raw_history заканчивался
+    «Источник: https://…/portcigar-dly-cera-doycona», и рассказ выходил про
+    несуществующего «царя Дойкона», вычитанного из slug'а URL.
+    """
+    raw = ("Справочно — Место создания: Санкт-Петербург; Техника: Чеканка; "
+           "Источник: https://fabergemuseum.ru/kollekczii/portcigar-dly-cera-doycona.")
+    assert llm._strip_sources(raw) == "Справочно — Место создания: Санкт-Петербург; Техника: Чеканка"
+    assert llm._strip_sources("Текст без ссылок.") == "Текст без ссылок."
+    assert llm._strip_sources(None) == ""
+    with patched(llm, gpt_response("рассказ"), **LLM_ENV) as calls:
+        asyncio.run(llm._yandexgpt_story({"name": "Портсигар", "raw_history": raw}, "engaging", "ru"))
+    assert "http" not in calls[0]["json"]["messages"][1]["text"]
+    with patched(llm, gpt_response(), **LLM_ENV) as calls:
+        asyncio.run(llm._yandexgpt_chat(raw, [], "что это?", "ru"))
+    assert "http" not in calls[0]["json"]["messages"][1]["text"]
+
+
 def test_shorten_cuts_on_sentence_boundary():
     assert llm._shorten("Короткий текст.", 100) == "Короткий текст."
     assert llm._shorten("Первое предложение. Второе предложение.", 25) == "Первое предложение."
