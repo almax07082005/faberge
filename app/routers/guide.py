@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from .. import crud
 from .. import models as m
 from .. import schemas as sch
+from ..config import settings
 from ..db import get_session
 from ..services import UpstreamError, guide_intel, llm, tts
 
@@ -260,12 +261,19 @@ async def chat(req: sch.ChatRequest, session: AsyncSession = Depends(get_session
     if req.history:
         history = [(msg.role, msg.content) for msg in req.history]
     else:
+        # Из БД поднимаем ровно столько последних реплик, сколько уйдёт в промпт
+        # (GUIDE_HISTORY_TURNS): в модель всё равно попадает только хвост, а
+        # тянуть весь диалог сессии — лишний трафик БД на каждом вопросе.
+        turns = max(0, settings.guide_history_turns)
         rows = (
             await session.execute(
-                select(m.GuideMessage).where(m.GuideMessage.session_id == sess.id).order_by(m.GuideMessage.id)
+                select(m.GuideMessage)
+                .where(m.GuideMessage.session_id == sess.id)
+                .order_by(m.GuideMessage.id.desc())
+                .limit(turns)
             )
         ).scalars().all()
-        history = [(r.role, r.content) for r in rows]
+        history = [(r.role, r.content) for r in reversed(rows)]
 
     # Ответ + структурированные данные (B6/B7/B10). Retrieval из каталога (B1) —
     # через crud.search_exhibits_orm / exhibits_by_number / all_halls_ordered.

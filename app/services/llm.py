@@ -1,14 +1,91 @@
 """Генерация рассказа и диалог ИИ-гида (YandexGPT + стаб)."""
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
 from ..config import settings
 from . import UpstreamError
 
+logger = logging.getLogger(__name__)
+
 YANDEXGPT_URL = "https://llm.api.cloud.yandex.net/foundationModels/v1/completion"
+
+# ── Выбор модели ─────────────────────────────────────────────────────────────
+# Не все задачи гида одинаково «умные». Рассказ и диалог — творческие, их
+# оставляем на основной модели; переписывание чисел прописью (to_spoken_text) —
+# механическая правка текста, на ней Pro-модель просто дороже при том же
+# результате, поэтому туда идёт lite.
+_PRO_SEGMENT = "/yandexgpt/"
+_LITE_SEGMENT = "/yandexgpt-lite/"
+
+
+def _model_uri(lite: bool = False) -> str:
+    """URI модели для запроса: основная или lite (см. YANDEXGPT_LITE_MODEL_URI)."""
+    base = settings.yandexgpt_model_uri or (
+        f"gpt://{settings.yandex_folder_id}/yandexgpt/latest" if settings.yandex_folder_id else ""
+    )
+    if not lite:
+        return base
+    if settings.yandexgpt_lite_model_uri:
+        return settings.yandexgpt_lite_model_uri
+    # Выводим lite из основного URI. Если основная модель дообученная (ds://…)
+    # или названа иначе, подменять нечего — работаем на ней же, чтобы запрос не
+    # ушёл в несуществующую модель.
+    if _PRO_SEGMENT in base:
+        return base.replace(_PRO_SEGMENT, _LITE_SEGMENT)
+    return base
+
+
+# ── Учёт расхода ─────────────────────────────────────────────────────────────
+def _as_int(value: Any) -> Optional[int]:
+    """usage в ответе YandexGPT приходит строками ("inputTextTokens": "412")."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _log_usage(operation: str, model_uri: str, result: Dict) -> None:
+    """Строка расхода на каждый вызов LLM — по ней считается стоимость ответа.
+
+    Формат намеренно plain-text key=value: логи Cloud Functions ищутся
+    подстрокой, а грепать `llm_usage operation=chat` проще, чем JSON.
+    """
+    if not settings.llm_log_usage:
+        return
+    usage = result.get("usage") or {}
+    logger.info(
+        "llm_usage operation=%s model=%s model_version=%s input_tokens=%s output_tokens=%s total_tokens=%s",
+        operation,
+        model_uri or "-",
+        result.get("modelVersion") or "-",
+        _as_int(usage.get("inputTextTokens")),
+        _as_int(usage.get("completionTokens")),
+        _as_int(usage.get("totalTokens")),
+    )
+
+
+def _shorten(text: str, limit: int) -> str:
+    """Обрезать справку до limit знаков по границе предложения.
+
+    Нужна ровно для промпта: в диалог уходит не весь raw_history (бывает
+    несколько тысяч знаков и оплачивается на КАЖДОМ уточняющем вопросе), а его
+    начало — там всегда главное о предмете. Режем по концу фразы, чтобы модель
+    не получала оборванное полуслово и не додумывала его.
+    """
+    text = (text or "").strip()
+    if limit <= 0 or len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = max(head.rfind(". "), head.rfind("! "), head.rfind("? "), head.rfind("; "))
+    if cut >= limit // 2:
+        return head[: cut + 1].rstrip()
+    space = head.rfind(" ")
+    return (head[:space] if space > 0 else head).rstrip(" ,;:—-") + "…"
+
 
 _STYLE_HINT = {
     "engaging": "живо и увлекательно",
@@ -30,7 +107,7 @@ async def generate_story(
     if settings.llm_configured:
         text = await _yandexgpt_story(exhibit, style, language)
         questions = await _yandexgpt_questions(exhibit, max_questions, language)
-        return text, questions, settings.yandexgpt_model_uri or "yandexgpt/latest"
+        return text, questions, _model_uri() or "yandexgpt/latest"
     text = _story_stub(exhibit, style)
     return text, _questions_stub(exhibit, max_questions), "stub/heuristic"
 
@@ -70,8 +147,17 @@ async def to_spoken_text(text: Optional[str]) -> Optional[str]:
     try:
         # temperature=0 — задача детерминированная (переписать, не сочинять);
         # запас max_tokens под длинное описание (числа прописью удлиняют текст).
+        # lite=True: заменить цифры словами — работа механическая, разницы с
+        # Pro на ней нет, а токены дешевле в разы. Качество подстраховано с двух
+        # сторон: вызывающий код в tts.prepare_for_tts отбрасывает явно
+        # «разговорившийся» ответ, а без LLM остаётся normalize_for_tts.
         result = await _yandexgpt_complete(
-            _SPOKEN_SYSTEM, _SPOKEN_USER_TMPL.format(text=text), temperature=0.0, max_tokens=2000
+            _SPOKEN_SYSTEM,
+            _SPOKEN_USER_TMPL.format(text=text),
+            temperature=0.0,
+            max_tokens=2000,
+            operation="tts_spoken",
+            lite=True,
         )
         return result or None
     except UpstreamError:
@@ -160,9 +246,17 @@ def _questions_stub(exhibit: Dict, max_questions: int) -> List[str]:
 
 
 # ── YandexGPT ────────────────────────────────────────────────────────────────
-async def _yandexgpt_complete(system: str, user: str, temperature: float = 0.6, max_tokens: int = 800) -> str:
+async def _yandexgpt_complete(
+    system: str,
+    user: str,
+    temperature: float = 0.6,
+    max_tokens: int = 800,
+    operation: str = "complete",
+    lite: bool = False,
+) -> str:
+    model_uri = _model_uri(lite)
     payload = {
-        "modelUri": settings.yandexgpt_model_uri or f"gpt://{settings.yandex_folder_id}/yandexgpt/latest",
+        "modelUri": model_uri,
         "completionOptions": {"stream": False, "temperature": temperature, "maxTokens": str(max_tokens)},
         "messages": [
             {"role": "system", "text": system},
@@ -177,7 +271,11 @@ async def _yandexgpt_complete(system: str, user: str, temperature: float = 0.6, 
             resp = await client.post(YANDEXGPT_URL, headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()
-            return data["result"]["alternatives"][0]["message"]["text"].strip()
+            result = data["result"]
+            # Расход — в лог до возврата ответа: по строкам llm_usage считается
+            # стоимость и видно, какая операция её создаёт.
+            _log_usage(operation, model_uri, result)
+            return result["alternatives"][0]["message"]["text"].strip()
     except Exception as exc:  # noqa: BLE001
         raise UpstreamError("Сервис генерации текста временно недоступен.") from exc
 
@@ -202,7 +300,24 @@ async def _yandexgpt_story(exhibit: Dict, style: str, language: str) -> str:
     if techniques:
         user += f", техники исполнения: {techniques}"
     user += "."
-    return await _yandexgpt_complete("Ты — ИИ-гид музея Фаберже.", user)
+    # Объём. Раньше ограничения не было вовсе, и модель выдавала ~2500 знаков:
+    # столько у витрины не слушают, а платим мы за каждый выходной токен.
+    # Ориентир задаём промптом, а не обрезкой — обрезка рвёт фразу на полуслове.
+    # max_tokens при этом держим с запасом над целью (GUIDE_STORY_MAX_TOKENS),
+    # чтобы он оставался страховкой от «разговорившейся» модели, а не резал
+    # нормальный рассказ.
+    user += (
+        f" Объём — не больше {settings.guide_story_max_chars} знаков, это примерно "
+        "5–7 предложений. Не пересказывай данные подряд: выбери главное — кто, когда, "
+        "чем предмет примечателен — и не повторяйся. Без вступлений вроде «сегодня мы "
+        "поговорим» и без перечня характеристик списком."
+    )
+    return await _yandexgpt_complete(
+        "Ты — ИИ-гид музея Фаберже.",
+        user,
+        max_tokens=settings.guide_story_max_tokens,
+        operation="story",
+    )
 
 
 # Системный промпт диалога. Прежняя формулировка подавала grounding как «Контекст
@@ -224,14 +339,21 @@ _CHAT_SYSTEM = (
 
 
 async def _yandexgpt_chat(grounding: str, history: List[Tuple[str, str]], message: str, language: str) -> str:
-    convo = "\n".join(f"{r}: {c}" for r, c in history[-6:])
+    # Входной контекст уточняющего вопроса — самая частая статья расхода: он
+    # уходит в модель на КАЖДУЮ реплику. Режем его с двух сторон — историю до
+    # GUIDE_HISTORY_TURNS последних реплик (было 6) и справку до
+    # GUIDE_GROUNDING_MAX_CHARS знаков по границе фразы. Обе величины в env:
+    # если качество ответов просядет, откатывается без релиза.
+    turns = max(0, settings.guide_history_turns)
+    convo = "\n".join(f"{r}: {c}" for r, c in (history[-turns:] if turns else []))
     parts = []
-    if grounding.strip():
+    grounding = _shorten(grounding, settings.guide_grounding_max_chars)
+    if grounding:
         parts.append(f"Справка о текущем месте посетителя (может быть не связана с вопросом): {grounding}")
     if convo:
         parts.append(f"История диалога:\n{convo}")
     parts.append(f"Вопрос посетителя: {message}")
-    return await _yandexgpt_complete(_CHAT_SYSTEM, "\n".join(parts))
+    return await _yandexgpt_complete(_CHAT_SYSTEM, "\n".join(parts), operation="chat")
 
 
 async def _yandexgpt_questions(exhibit: Dict, max_questions: int, language: str) -> List[str]:
@@ -242,6 +364,12 @@ async def _yandexgpt_questions(exhibit: Dict, max_questions: int, language: str)
         f"На основе данных об экспонате ({raw}) предложи {max_questions} коротких вопроса, "
         "которые посетитель захотел бы задать гиду. Каждый вопрос с новой строки, без нумерации."
     )
-    text = await _yandexgpt_complete("Ты помогаешь придумать вопросы для диалога с гидом.", user, temperature=0.7, max_tokens=200)
+    text = await _yandexgpt_complete(
+        "Ты помогаешь придумать вопросы для диалога с гидом.",
+        user,
+        temperature=0.7,
+        max_tokens=200,
+        operation="questions",
+    )
     questions = [q.strip(" -•\t") for q in text.splitlines() if q.strip()]
     return questions[:max_questions]

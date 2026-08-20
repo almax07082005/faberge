@@ -90,6 +90,30 @@ ML-сервис поиска по фото ключует предметы по 
 через `TTS_SPOKEN_VIA_LLM=false`. Нормализация выполняется **до** подсчёта
 символов и ключа кэша аудио.
 
+### Расход LLM и SpeechKit
+
+Счёт за облако формируют два потока: токены YandexGPT и запросы SpeechKit. Что
+сделано, чтобы он не рос сам по себе (19.08.2026):
+
+| Мера | Где | Настройка |
+|---|---|---|
+| SpeechKit **API v3** вместо v1 — тарификация по запросам, а не по символам | `app/services/tts.py` (`_fetch_v3`) | `SPEECHKIT_API_VERSION=v3` \| `v1` (откат) |
+| Числа прописью считает **lite**-модель: правка механическая, Pro на ней переплата | `llm._model_uri(lite=True)` | `YANDEXGPT_LITE_MODEL_URI` (пусто — выводится из основного URI) |
+| Короче контекст уточняющего вопроса: 3 последние реплики вместо 6 и справка до 700 знаков по границе фразы | `llm._yandexgpt_chat`, `llm._shorten` | `GUIDE_HISTORY_TURNS`, `GUIDE_GROUNDING_MAX_CHARS` |
+| Рассказ вдвое короче — объём задан промптом (обрезка рвала бы фразу), `maxTokens` только страховка | `llm._yandexgpt_story` | `GUIDE_STORY_MAX_CHARS`, `GUIDE_STORY_MAX_TOKENS` |
+| Расход в логах: строка на каждый вызов | `llm._log_usage`, `tts._synthesize_yandex` | `LLM_LOG_USAGE=true` |
+
+Строки расхода (уровень `INFO`) грепаются в логах функции:
+
+```
+llm_usage operation=chat model=gpt://<folder>/yandexgpt/latest model_version=… input_tokens=412 output_tokens=180 total_tokens=592
+tts_request api=v3 voice=alena role=good fmt=mp3 chars=284 duration_ms=19040 bytes=76032
+```
+
+`operation` — `story` | `chat` | `questions` | `tts_spoken`: видно не только
+сколько потрачено, но и на что. Один ход диалога — это **два** вызова LLM
+(ответ + вопросы-подсказки), в логе они идут парой `chat` и `questions`.
+
 ## Документация API: два представления
 
 | | Дизайн-контракт | Живая реализация |
@@ -140,6 +164,7 @@ docs/
   analytics-privacy.md  Состав данных аналитики: что храним, зачем, как обезличено
   analytics-metrics.md  Метрики визита: формулировки плиток и знаменатель конверсий
   chat-history-decision.md      История чатов: как есть, решение и контракт ручки
+  task-2026-08-19-llm-cost.md   Расход LLM/SpeechKit: что урезано, чем меряем, чем откатывается
 assets/fonts/           TTF с кириллицей для PDF-выгрузки (в git не хранится, см. ниже)
 tests/                  Юнит-тесты чистых функций (запускаются без БД и сети)
 Dockerfile, docker-compose.yml, .env.example
@@ -150,6 +175,7 @@ Dockerfile, docker-compose.yml, .env.example
 ```bash
 python tests/test_guide_intel.py        # разбор намерения реплики гида (B7/B9/B10, C25)
 python tests/test_text_normalize.py     # числительные для озвучки («Пётр Первый»)
+python tests/test_llm_cost.py           # расход LLM/SpeechKit: lite, короткий контекст, v3, логи
 python tests/test_recognizer_match.py   # сшивка названий ML-индекса с каталогом
 python tests/test_question_cluster.py   # смысловая группировка вопросов посетителей
 python tests/test_visits.py             # разбиение сессии на визиты по таймауту 30 мин
