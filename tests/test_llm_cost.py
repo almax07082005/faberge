@@ -250,6 +250,19 @@ def test_usage_survives_missing_fields():
     assert "input_tokens=None" in next(m for m in messages if m.startswith("llm_usage"))
 
 
+def test_app_raises_root_log_level():
+    """Без явного уровня INFO-строки расхода не доходят до логов Cloud Functions.
+
+    Рантайм вешает на корневой логгер свой обработчик и оставляет уровень
+    WARNING; `logging.basicConfig` в этом случае молча ничего не делает.
+    Проверено на проде 20.08.2026 — llm_usage не было в логах вовсе.
+    """
+    import app.main  # noqa: F401  (импорт сам настраивает логирование)
+
+    assert logging.getLogger().level <= logging.INFO
+    assert logging.getLogger("httpx").level == logging.WARNING
+
+
 # ── 1. SpeechKit v3 ─────────────────────────────────────────────────────────
 def v3_stream(*chunks: bytes, start_ms: int = 0, length_ms: int = 1000) -> str:
     lines = []

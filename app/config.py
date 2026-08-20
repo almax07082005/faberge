@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     admin_username: str = "admin"                 # логин для POST /admin/login
     admin_password: str = "admin"                 # пароль для POST /admin/login (переопределите в проде!)
     media_dir: str = "media"                      # локальное хранилище (стаб Object Storage)
+    # Уровень логирования приложения. INFO нужен, чтобы в проде были видны
+    # строки расхода (llm_usage / tts_request) и диагностика распознавания;
+    # выставляется корневому логгеру в app/main.py.
+    log_level: str = "INFO"
 
     # ── Загрузка файлов ──────────────────────────────────────────────────────
     # П.10 баг-репорта 06.08.2026. Приложение обещало 10 МБ, но Yandex API Gateway

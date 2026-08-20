@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 
 from fastapi import FastAPI
@@ -33,6 +34,21 @@ from .routers import (
     telemetry,
 )
 from .services import UpstreamError
+
+# ── Уровень логирования ──────────────────────────────────────────────────────
+# Без этого INFO-строки приложения не видны в проде: рантайм Cloud Functions
+# ставит на корневой логгер свой обработчик, а уровень остаётся WARNING —
+# `logging.basicConfig` в таком случае молча ничего не делает (он уходит
+# раньше, если обработчики уже есть). Проверено на проде 20.08.2026: строк
+# `llm_usage`/`tts_request` в логах функции не было вовсе, хотя код их писал.
+# Поэтому уровень выставляем явно, самому корневому логгеру.
+_root_logger = logging.getLogger()
+_root_logger.setLevel(getattr(logging, (settings.log_level or "INFO").upper(), logging.INFO))
+if not _root_logger.handlers:
+    logging.basicConfig(level=_root_logger.level)
+# httpx на INFO печатает строку на каждый исходящий запрос («HTTP Request: POST
+# … 200 OK») — дублирует наши собственные строки расхода, только без цифр.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 DESCRIPTION = """
 Backend мобильного web-приложения (PWA) **«ИИ-гид музея Фаберже»**.
