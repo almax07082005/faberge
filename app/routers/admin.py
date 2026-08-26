@@ -16,7 +16,7 @@ from .. import schemas as sch
 from ..config import settings
 from ..db import get_session
 from ..dependencies import require_admin
-from ..services import UpstreamError, analytics_export, llm, storage
+from ..services import UpstreamError, analytics_export, guide_questions, llm, storage
 
 # Логин выдаёт токен, поэтому НЕ должен сам требовать токен — отдельный роутер без require_admin.
 auth_router = APIRouter(prefix="/admin", tags=["Администрирование"])
@@ -402,6 +402,76 @@ async def delete_media(
     await crud.delete_exhibit_image(session, img)
     await storage.delete_many([url])
 
+
+# ── Кэш вопросов-подсказок ИИ-гида (26.08.2026) ──────────────────────────────
+async def _questions_status(session: AsyncSession, language: str) -> sch.GuideQuestionsStatus:
+    total, cached = await crud.exhibit_questions_coverage(session, language)
+    return sch.GuideQuestionsStatus(
+        language=language, exhibits=total, cached=cached, missing=max(0, total - cached)
+    )
+
+
+@router.get(
+    "/guide/questions/status", response_model=sch.GuideQuestionsStatus,
+    summary="Кэш вопросов-подсказок: покрытие каталога",
+    description=(
+        "Сколько карточек уже имеют сохранённые вопросы-подсказки, а сколько ещё "
+        "ни разу не генерировались. Прогрев — `POST /admin/guide/questions/warm`.\n\n"
+        "`cached` считает наличие записи, а не её свежесть: устаревшая запись "
+        "(музей поправил описание) распознаётся по хэшу исходного текста и "
+        "перегенерируется сама при первом обращении посетителя."
+    ),
+)
+async def guide_questions_status(
+    language: str = Query("ru", max_length=8), session: AsyncSession = Depends(get_session)
+) -> sch.GuideQuestionsStatus:
+    return await _questions_status(session, language)
+
+
+@router.post(
+    "/guide/questions/warm", response_model=sch.GuideQuestionsWarmResult,
+    summary="Кэш вопросов-подсказок: прогреть порцию каталога",
+    description=(
+        "Генерирует и сохраняет вопросы-подсказки для карточек, у которых их ещё "
+        "нет. Разовый прогрев всего каталога удобнее гнать скриптом "
+        "(`python scripts/warm_guide_questions.py --apply`): 1200+ карточек — это "
+        "1200+ вызовов LLM, и в один HTTP-запрос они не укладываются. Отсюда "
+        "прогрев идёт ПОРЦИЯМИ по `limit` карточек: вызывайте, пока `missing` не "
+        "станет нулём.\n\n"
+        "Идемпотентно: карточки со свежей записью пропускаются без обращения к "
+        "LLM (их считает поле `cached`). `force=true` перегенерирует и их — нужен, "
+        "только если менялся сам промпт генерации вопросов либо подняли "
+        "`GUIDE_QUESTIONS_CACHE_SIZE` и нужно расширить уже записанные наборы.\n\n"
+        "Сбой LLM на карточке не прерывает порцию: такая карточка попадает в "
+        "`failed` и будет прогрета следующим вызовом."
+    ),
+)
+async def guide_questions_warm(
+    limit: int = Query(25, ge=1, le=200, description="Сколько карточек обработать за вызов."),
+    language: str = Query("ru", max_length=8),
+    force: bool = Query(False, description="Перегенерировать даже свежие записи."),
+    session: AsyncSession = Depends(get_session),
+) -> sch.GuideQuestionsWarmResult:
+    # only_missing при обычном прогреве: иначе каждый следующий вызов снова
+    # упирался бы в те же первые limit карточек, уже прогретых. С force=true
+    # берём подряд — там смысл как раз в перегенерации существующих.
+    rows = await crud.exhibits_to_warm(
+        session, language=language, limit=limit, only_missing=not force
+    )
+    counts = {"generated": 0, "cached": 0, "failed": 0, "planned": 0}
+    for ex, cached_row in rows:
+        outcome, _ = await guide_questions.warm_exhibit(
+            session, ex, cached_row, language=language, force=force
+        )
+        counts[outcome] += 1
+    return sch.GuideQuestionsWarmResult(
+        language=language,
+        processed=len(rows),
+        generated=counts["generated"],
+        cached=counts["cached"],
+        failed=counts["failed"],
+        status=await _questions_status(session, language),
+    )
 
 
 # ── Аналитика ────────────────────────────────────────────────────────────────

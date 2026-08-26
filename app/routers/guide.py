@@ -13,7 +13,7 @@ from .. import models as m
 from .. import schemas as sch
 from ..config import settings
 from ..db import get_session
-from ..services import UpstreamError, guide_intel, llm, tts
+from ..services import UpstreamError, guide_intel, guide_questions, llm, tts
 
 router = APIRouter(prefix="/guide", tags=["ИИ-гид"])
 
@@ -129,9 +129,14 @@ async def generate_story(req: sch.StoryRequest, session: AsyncSession = Depends(
     if ex is None:
         raise HTTPException(status_code=404, detail="Экспонат не найден.")
 
+    exhibit_dict = crud.exhibit_to_dict(ex)
     try:
-        text, questions, model = await llm.generate_story(
-            crud.exhibit_to_dict(ex), req.style.value, req.language, req.max_questions
+        text, model = await llm.generate_story(exhibit_dict, req.style.value, req.language)
+        # Вопросы-подсказки — из кэша (таблица exhibit_questions): они зависят
+        # только от карточки, а раньше считались вторым вызовом LLM на каждый
+        # рассказ (просьба заказчика 26.08.2026).
+        questions = await guide_questions.for_exhibit(
+            session, exhibit_dict, req.max_questions, req.language
         )
         audio_url = None
         if req.include_audio:
@@ -321,9 +326,7 @@ async def chat(req: sch.ChatRequest, session: AsyncSession = Depends(get_session
     else:
         # Обычный диалог: LLM-ответ + retrieval-обвязка (B6/B7).
         try:
-            answer, questions = await llm.chat(
-                grounding, history, req.message, req.language, req.max_questions, exhibit_dict
-            )
+            answer = await llm.chat(grounding, history, req.message, req.language)
         except UpstreamError as exc:
             # Сбой LLM — тоже «вопрос без ответа»: записываем реплику с причиной
             # `error` до того, как отдать 502, иначе такие вопросы не попадут ни
@@ -332,6 +335,17 @@ async def chat(req: sch.ChatRequest, session: AsyncSession = Depends(get_session
                 session, sess, req.message, exc.message, context, answered=False, fail_reason="error"
             )
             raise HTTPException(status_code=502, detail=exc.message)
+        # Подсказки к ответу — из кэша по экспонату из контекста (26.08.2026).
+        # Как и раньше, вне контекста экспоната подсказок нет: в общем чате их
+        # не к чему привязать. Сбой генерации подсказок не должен ронять уже
+        # полученный ответ гида — отдаём ответ без них.
+        if exhibit_dict is not None:
+            try:
+                questions = await guide_questions.for_exhibit(
+                    session, exhibit_dict, req.max_questions, req.language
+                )
+            except UpstreamError:
+                questions = []
         # B6 — экспонаты, о которых речь: retrieval по вопросу + ответу.
         found = await crud.search_exhibits_orm(session, f"{req.message} {answer}", limit=4)
         referenced_exhibits = _merge_referenced(context_exhibit, found)

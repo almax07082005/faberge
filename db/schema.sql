@@ -157,6 +157,32 @@ CREATE TABLE IF NOT EXISTS exhibit_images (
     position   INT NOT NULL DEFAULT 0
 );
 
+-- Кэш вопросов-подсказок ИИ-гида ---------------------------------------------
+-- Вопросы под рассказом («Кому подарили это яйцо?») зависят только от карточки
+-- экспоната, а генерировались на КАЖДЫЙ открытый экспонат и на КАЖДУЮ реплику
+-- диалога — вторым вызовом LLM рядом с рассказом/ответом. Один и тот же
+-- экспонат за день открывают десятки посетителей, и текст вопросов при этом
+-- каждый раз оплачивается заново. Здесь он хранится.
+--
+-- source_hash — sha256 от текста, из которого вопросы сгенерированы (то же, что
+-- уходит в промпт: raw_history / short_description / name после чистки от
+-- ссылок-источников) плюс язык. Отредактировал музей описание — хэш разошёлся,
+-- запись считается устаревшей и перегенерируется сама, без ручной инвалидации.
+-- TTL нет намеренно: описание меняется редко, а «протухание по времени» просто
+-- вернуло бы часть расхода.
+CREATE TABLE IF NOT EXISTS exhibit_questions (
+    exhibit_id  INT         NOT NULL REFERENCES exhibits(id) ON DELETE CASCADE,
+    language    VARCHAR(8)  NOT NULL DEFAULT 'ru',
+    -- Список строк по порядку показа. Храним пул (GUIDE_QUESTIONS_CACHE_SIZE),
+    -- а отдаём срез под max_questions запроса: /guide/story просит 4,
+    -- /guide/chat — 3, и разные лимиты не должны бить друг другу кэш.
+    questions   JSONB       NOT NULL,
+    source_hash CHAR(64)    NOT NULL,
+    model       VARCHAR(128),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (exhibit_id, language)
+);
+
 -- Диалоги с ИИ-гидом ---------------------------------------------------------
 CREATE TABLE IF NOT EXISTS guide_sessions (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -246,6 +272,8 @@ CREATE INDEX IF NOT EXISTS idx_showcases_hall       ON showcases(hall_id);
 CREATE INDEX IF NOT EXISTS idx_exhibits_showcase    ON exhibits(showcase_id);
 CREATE INDEX IF NOT EXISTS idx_exhibit_images_exh   ON exhibit_images(exhibit_id);
 CREATE INDEX IF NOT EXISTS idx_guide_messages_sess  ON guide_messages(session_id);
+-- Прогрев каталога и отчёт «сколько карточек без вопросов» ходят по свежести записи.
+CREATE INDEX IF NOT EXISTS idx_exhibit_questions_updated ON exhibit_questions(updated_at);
 CREATE INDEX IF NOT EXISTS idx_events_type_ts       ON events(type, ts);
 CREATE INDEX IF NOT EXISTS idx_events_session_ts    ON events(session_id, ts);  -- аналитика по сессиям (C17/C18)
 -- Аналитика 03.08.2026 (§2): events не чистится и растёт линейно от посещаемости,

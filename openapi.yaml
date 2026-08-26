@@ -1457,6 +1457,93 @@ paths:
               example:
                 detail: LLM не настроен.
 
+  /admin/guide/questions/status:
+    get:
+      tags: [Администрирование]
+      summary: 'Кэш вопросов-подсказок: покрытие каталога'
+      description: >-
+        Сколько карточек уже имеют сохранённые вопросы-подсказки, а сколько ещё
+        ни разу не генерировались. `cached` считает НАЛИЧИЕ записи, а не её
+        свежесть: устаревшая запись (музей поправил описание) распознаётся по
+        хэшу исходного текста и перегенерируется сама при первом обращении
+        посетителя. Прогрев — `POST /admin/guide/questions/warm`.
+      operationId: guideQuestionsStatus
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: language
+          in: query
+          description: Язык вопросов.
+          required: false
+          schema:
+            type: string
+            maxLength: 8
+            default: ru
+      responses:
+        '200':
+          description: Покрытие каталога кэшем.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GuideQuestionsStatus'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /admin/guide/questions/warm:
+    post:
+      tags: [Администрирование]
+      summary: 'Кэш вопросов-подсказок: прогреть порцию каталога'
+      description: >-
+        Генерирует и сохраняет вопросы-подсказки для карточек, у которых их ещё
+        нет. Прогрев идёт ПОРЦИЯМИ по `limit` карточек (1200+ карточек — это
+        1200+ вызовов LLM, в один HTTP-запрос они не укладываются): вызывайте,
+        пока `status.missing` не станет нулём. Разовый прогрев всего каталога
+        удобнее гнать скриптом: `python scripts/warm_guide_questions.py --apply`.
+
+
+        Идемпотентно: карточки со свежей записью пропускаются без обращения к
+        LLM (их считает поле `cached`). `force=true` перегенерирует и их — нужен,
+        только если менялся сам промпт генерации вопросов либо подняли
+        `GUIDE_QUESTIONS_CACHE_SIZE`. Сбой LLM на карточке
+        не прерывает порцию: она попадает в `failed` и будет прогрета следующим
+        вызовом.
+      operationId: warmGuideQuestions
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          description: Сколько карточек обработать за вызов.
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 25
+        - name: language
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 8
+            default: ru
+        - name: force
+          in: query
+          description: Перегенерировать даже свежие записи.
+          required: false
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Итог порции прогрева.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GuideQuestionsWarmResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
   /admin/analytics/overview:
     get:
       tags: [Администрирование]
@@ -4279,6 +4366,52 @@ components:
           type: string
           format: date-time
           example: '2026-08-03T04:00:00Z'
+
+    # ── Кэш вопросов-подсказок ──
+    GuideQuestionsStatus:
+      type: object
+      properties:
+        language:
+          type: string
+          default: ru
+        exhibits:
+          type: integer
+          description: Всего карточек в каталоге.
+          example: 1252
+        cached:
+          type: integer
+          description: Карточек с сохранёнными вопросами.
+          example: 1252
+        missing:
+          type: integer
+          description: Карточек, у которых записи кэша ещё нет.
+          example: 0
+
+    GuideQuestionsWarmResult:
+      type: object
+      required: [status]
+      properties:
+        language:
+          type: string
+          default: ru
+        processed:
+          type: integer
+          description: Сколько карточек взято в эту порцию.
+          example: 25
+        generated:
+          type: integer
+          description: Сгенерировано и записано (вызовов LLM).
+          example: 24
+        cached:
+          type: integer
+          description: Запись была свежей, LLM не вызывался.
+          example: 0
+        failed:
+          type: integer
+          description: LLM отказал; карточка будет прогрета следующим вызовом.
+          example: 1
+        status:
+          $ref: '#/components/schemas/GuideQuestionsStatus'
 
     # ── Телеметрия ──
     Event:

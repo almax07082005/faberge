@@ -151,6 +151,28 @@ class ExhibitImage(Base):
     exhibit: Mapped["Exhibit"] = relationship(back_populates="images")
 
 
+class ExhibitQuestions(Base):
+    """Кэш вопросов-подсказок ИИ-гида по экспонату (просьба заказчика 26.08.2026).
+
+    Вопросы зависят только от карточки — ни от посетителя, ни от истории диалога,
+    — а считались отдельным вызовом LLM на каждый рассказ и каждую реплику.
+    Свежесть определяется ``source_hash`` (текст промпта + язык), а не временем:
+    описание правят редко, а TTL вернул бы часть расхода обратно.
+    """
+
+    __tablename__ = "exhibit_questions"
+
+    exhibit_id: Mapped[int] = mapped_column(
+        ForeignKey("exhibits.id", ondelete="CASCADE"), primary_key=True
+    )
+    language: Mapped[str] = mapped_column(String(8), primary_key=True, default="ru")
+    # Пул вопросов по порядку показа; наружу отдаётся срез под max_questions запроса.
+    questions: Mapped[list] = mapped_column(JSONB, nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[Optional[str]] = mapped_column(String(128))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class GuideSession(Base):
     __tablename__ = "guide_sessions"
 
