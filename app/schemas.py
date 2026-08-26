@@ -725,6 +725,25 @@ class AnalyticsRebuildResult(BaseModel):
     updated_at: datetime
 
 
+# ── Кэш вопросов-подсказок (26.08.2026) ──────────────────────────────────────
+class GuideQuestionsStatus(BaseModel):
+    """Покрытие каталога кэшем вопросов: сколько карточек прогрето."""
+    language: str = "ru"
+    exhibits: int = 0
+    cached: int = 0
+    missing: int = 0                  # карточки, у которых записи кэша ещё нет
+
+
+class GuideQuestionsWarmResult(BaseModel):
+    """Итог порции прогрева. `cached` — карточки, где запись была свежей и LLM не звали."""
+    language: str = "ru"
+    processed: int = 0
+    generated: int = 0
+    cached: int = 0
+    failed: int = 0
+    status: GuideQuestionsStatus
+
+
 # ── Телеметрия ───────────────────────────────────────────────────────────────
 class EventType(str, enum.Enum):
     """Словарь типов событий — единственный источник правды контракта телеметрии.

@@ -557,6 +557,108 @@ async def candidates_by_slugs(session: AsyncSession, slugs: Sequence[str]) -> Di
     return {slug: (ex_id, image_url) for slug, ex_id, image_url in rows.all()}
 
 
+# ── Кэш вопросов-подсказок (просьба заказчика 26.08.2026) ────────────────────
+# Хранилище для services/guide_questions: там решение «свежо / пора
+# перегенерировать», здесь — только чтение и запись строк.
+async def get_exhibit_questions(
+    session: AsyncSession, exhibit_id: int, language: str = "ru"
+) -> Optional[m.ExhibitQuestions]:
+    """Запись кэша по экспонату и языку (или None)."""
+    return (
+        await session.execute(
+            select(m.ExhibitQuestions).where(
+                m.ExhibitQuestions.exhibit_id == exhibit_id,
+                m.ExhibitQuestions.language == language,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def save_exhibit_questions(
+    session: AsyncSession,
+    exhibit_id: int,
+    language: str,
+    questions: List[str],
+    source_hash: str,
+    model: Optional[str] = None,
+) -> None:
+    """Записать/обновить кэш вопросов (UPSERT по (exhibit_id, language)).
+
+    Коммитим здесь: вызов приходит из середины обработки запроса гида, и кэш не
+    должен зависеть от того, дойдёт ли этот запрос до своего commit'а. Строки
+    диалога, добавленные к этому моменту, — валидное состояние сессии.
+    """
+    stmt = pg_insert(m.ExhibitQuestions).values(
+        exhibit_id=exhibit_id,
+        language=language,
+        questions=list(questions),
+        source_hash=source_hash,
+        model=model,
+        updated_at=datetime.now(timezone.utc),
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[m.ExhibitQuestions.exhibit_id, m.ExhibitQuestions.language],
+        set_={
+            "questions": stmt.excluded.questions,
+            "source_hash": stmt.excluded.source_hash,
+            "model": stmt.excluded.model,
+            "updated_at": stmt.excluded.updated_at,
+        },
+    )
+    await session.execute(stmt)
+    await session.commit()
+
+
+async def exhibit_questions_coverage(session: AsyncSession, language: str = "ru") -> Tuple[int, int]:
+    """(сколько экспонатов всего, у скольких есть запись кэша) — для отчёта прогрева.
+
+    «Есть запись» ≠ «запись свежая»: устаревание определяется хэшем исходного
+    текста, а его без самих карточек не посчитать (это делает прогрев).
+    """
+    total = (await session.execute(select(func.count()).select_from(m.Exhibit))).scalar_one()
+    cached = (
+        await session.execute(
+            select(func.count())
+            .select_from(m.ExhibitQuestions)
+            .where(m.ExhibitQuestions.language == language)
+        )
+    ).scalar_one()
+    return int(total), int(cached)
+
+
+async def exhibits_to_warm(
+    session: AsyncSession,
+    language: str = "ru",
+    limit: Optional[int] = None,
+    ids: Optional[Sequence[int]] = None,
+    only_missing: bool = False,
+) -> List[Tuple[m.Exhibit, Optional[m.ExhibitQuestions]]]:
+    """Карточки вместе с их записью кэша — вход для прогрева каталога.
+
+    `only_missing=True` оставляет лишь карточки совсем без записи: так порционный
+    прогрев из админки не перечитывает по кругу уже прогретый каталог. Свежесть
+    существующих записей проверяет вызывающий (сверкой хэша).
+    """
+    stmt = (
+        select(m.Exhibit, m.ExhibitQuestions)
+        .outerjoin(
+            m.ExhibitQuestions,
+            and_(
+                m.ExhibitQuestions.exhibit_id == m.Exhibit.id,
+                m.ExhibitQuestions.language == language,
+            ),
+        )
+        .order_by(m.Exhibit.id)
+    )
+    if ids:
+        stmt = stmt.where(m.Exhibit.id.in_(list(ids)))
+    if only_missing:
+        stmt = stmt.where(m.ExhibitQuestions.exhibit_id.is_(None))
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    return [(ex, row) for ex, row in (await session.execute(stmt)).all()]
+
+
 # ── Администрирование (CRUD) ─────────────────────────────────────────────────
 async def create_hall(session: AsyncSession, data: sch.HallCreate) -> sch.HallDetail:
     if data.sort_order is not None:

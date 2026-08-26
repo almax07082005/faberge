@@ -119,15 +119,41 @@ async def generate_story(
     exhibit: Dict,
     style: str = "engaging",
     language: str = "ru",
-    max_questions: int = 4,
-) -> Tuple[str, List[str], str]:
-    """Вернуть (текст рассказа, вопросы-подсказки, имя модели)."""
+) -> Tuple[str, str]:
+    """Вернуть (текст рассказа, имя модели).
+
+    Вопросы-подсказки сюда больше не входят: они зависят только от карточки
+    экспоната и берутся из кэша (``services.guide_questions``), а не считаются
+    заново на каждый рассказ — просьба заказчика 26.08.2026.
+    """
     if settings.llm_configured:
         text = await _yandexgpt_story(exhibit, style, language)
+        return text, _model_uri() or "yandexgpt/latest"
+    return _story_stub(exhibit, style), "stub/heuristic"
+
+
+def questions_source(exhibit: Dict) -> str:
+    """Текст, из которого генерируются вопросы-подсказки, — он же ключ свежести кэша.
+
+    Ровно то, что уходит в промпт ``_yandexgpt_questions``. Вынесено отдельно,
+    чтобы ``guide_questions`` считал хэш по тому же тексту: разошёлся текст
+    карточки — разошёлся хэш — запись перегенерируется сама.
+    """
+    return _strip_sources(
+        exhibit.get("raw_history") or exhibit.get("short_description") or exhibit.get("name", "")
+    )
+
+
+async def suggested_questions(
+    exhibit: Dict, max_questions: int, language: str = "ru"
+) -> Tuple[List[str], str]:
+    """Вернуть (вопросы-подсказки, имя модели). Без кэша — прямой вызов LLM/стаба."""
+    if max_questions <= 0:
+        return [], ""
+    if settings.llm_configured:
         questions = await _yandexgpt_questions(exhibit, max_questions, language)
-        return text, questions, _model_uri() or "yandexgpt/latest"
-    text = _story_stub(exhibit, style)
-    return text, _questions_stub(exhibit, max_questions), "stub/heuristic"
+        return questions, _model_uri() or "yandexgpt/latest"
+    return _questions_stub(exhibit, max_questions), "stub/heuristic"
 
 
 _SPOKEN_SYSTEM = (
@@ -187,15 +213,16 @@ async def chat(
     history: List[Tuple[str, str]],
     message: str,
     language: str = "ru",
-    max_questions: int = 3,
-    exhibit: Optional[Dict] = None,
-) -> Tuple[str, List[str]]:
-    """Вернуть (ответ гида, новые вопросы-подсказки)."""
+) -> str:
+    """Вернуть ответ гида.
+
+    Вопросы-подсказки к ответу больше не считаются здесь: они привязаны к
+    экспонату из контекста, а не к реплике, и берутся из кэша
+    (``services.guide_questions``) — просьба заказчика 26.08.2026.
+    """
     if settings.llm_configured:
-        answer = await _yandexgpt_chat(grounding, history, message, language)
-        questions = await _yandexgpt_questions(exhibit or {}, max_questions, language) if exhibit else []
-        return answer, questions
-    return _chat_stub(grounding, message), _questions_stub(exhibit or {}, max_questions)
+        return await _yandexgpt_chat(grounding, history, message, language)
+    return _chat_stub(grounding, message)
 
 
 # ── Стаб ─────────────────────────────────────────────────────────────────────
@@ -379,7 +406,7 @@ async def _yandexgpt_chat(grounding: str, history: List[Tuple[str, str]], messag
 async def _yandexgpt_questions(exhibit: Dict, max_questions: int, language: str) -> List[str]:
     if max_questions <= 0:
         return []
-    raw = _strip_sources(exhibit.get("raw_history") or exhibit.get("short_description") or exhibit.get("name", ""))
+    raw = questions_source(exhibit)
     user = (
         f"На основе данных об экспонате ({raw}) предложи {max_questions} коротких вопроса, "
         "которые посетитель захотел бы задать гиду. Каждый вопрос с новой строки, без нумерации."
