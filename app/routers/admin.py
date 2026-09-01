@@ -275,23 +275,68 @@ async def get_exhibit_admin(
     return crud.to_exhibit(ex, admin=True)
 
 
-@router.put("/exhibits/{exhibit_id}", response_model=sch.ExhibitAdmin, summary="[Вне MVP] Полностью обновить экспонат")
+@router.put(
+    "/exhibits/{exhibit_id}", response_model=sch.ExhibitAdmin,
+    summary="[Вне MVP] Обновить экспонат",
+    description=(
+        "Обновление карточки. Тело сливается с текущей карточкой: поле, которого "
+        "НЕТ в теле запроса, остаётся как было, а **явный `null` поле стирает** — "
+        "чтобы очистить описание или ссылку, пришлите `null`, а не пропустите поле.\n\n"
+        "До 31.08.2026 было наоборот: непереданное поле обнулялось. Админка "
+        "присылает форму частично, и правка техник у яйца «Ренессанс» унесла "
+        "изображение, описание и материалы — см. `docs/task-2026-08-31-admin-put-data-loss.md`.\n\n"
+        "Прежняя семантика полной замены доступна по `?full_replace=true` — только "
+        "для скриптов, которые сознательно перезаписывают карточку целиком.\n\n"
+        "Отдельное правило для `image_url`: он — зеркало строки галереи с `is_primary`. "
+        "Если поля в теле НЕТ, а в карточке оно пусто при целой галерее, сервер вернёт "
+        "URL оттуда — так лечатся карточки, испорченные до 31.08.2026. Явно присланный "
+        "`image_url` (в том числе `null`) это лечение отключает и записывается как есть. "
+        "Правило действует и при `?full_replace=true` — это единственное поле, которое "
+        "полная замена не обнуляет: рассогласовать `image_url` с `exhibit_images` нельзя "
+        "ни в одном режиме.\n\n"
+        "Если нужно поменять одно-два поля, правильнее `PATCH /admin/exhibits/{id}`: "
+        "там та же слитная семантика, но тело меньше и намерение читается однозначно."
+    ),
+)
 async def update_exhibit(
-    data: sch.ExhibitUpdate, exhibit_id: int = Path(ge=1), session: AsyncSession = Depends(get_session)
+    data: sch.ExhibitUpdate,
+    exhibit_id: int = Path(ge=1),
+    full_replace: bool = Query(
+        False,
+        description=(
+            "Полная замена: поля, которых нет в теле, обнуляются. По умолчанию false — "
+            "непереданные поля сохраняются. Исключение одно — `image_url`: он зеркало "
+            "строки галереи с `is_primary` и восстанавливается из неё даже при полной "
+            "замене; чтобы снять главное фото, пришлите `image_url: null` явно."
+        ),
+    ),
+    session: AsyncSession = Depends(get_session),
 ) -> sch.ExhibitAdmin:
     ex = await crud.get_exhibit_orm(session, exhibit_id)
     if ex is None:
         raise HTTPException(status_code=404, detail="Экспонат не найден.")
     await _autofill_spoken(data)
     try:
-        ex = await crud.replace_exhibit(session, ex, data)
+        ex = await crud.replace_exhibit(session, ex, data, full_replace=full_replace)
     except IntegrityError:
         await session.rollback()
         raise HTTPException(status_code=409, detail="Нарушение уникальности label_slug.")
     return crud.to_exhibit(ex, admin=True)
 
 
-@router.patch("/exhibits/{exhibit_id}", response_model=sch.ExhibitAdmin, summary="[Вне MVP] Частично обновить экспонат")
+@router.patch(
+    "/exhibits/{exhibit_id}", response_model=sch.ExhibitAdmin,
+    summary="[Вне MVP] Частично обновить экспонат",
+    description=(
+        "Частичное обновление: пишутся только переданные поля. Явный `null` "
+        "стирает поле — других способов очистить его нет, включая `image_url` "
+        "(`{\"image_url\": null}` снимает главное фото, оставляя снимок в галерее). "
+        "Если `image_url` в теле НЕ передан, а в карточке он пуст при целой галерее, "
+        "сервер подставит URL строки с `is_primary` — то же лечение, что и у `PUT`. "
+        "Рекомендуемый способ правки карточки: тело меньше, чем у `PUT`, и намерение "
+        "видно по запросу."
+    ),
+)
 async def patch_exhibit(
     data: sch.ExhibitPatch, exhibit_id: int = Path(ge=1), session: AsyncSession = Depends(get_session)
 ) -> sch.ExhibitAdmin:
@@ -543,7 +588,12 @@ async def analytics_questions(
         "Показывает, чего не хватает в описаниях экспонатов. Признак `answered` и "
         "причина отказа проставляются в момент генерации ответа: `no_context` — "
         "не было справки, `llm_refusal` — модель отказалась при наличии материалов, "
+        "`llm_hedge` — ответила по существу, но с оговоркой «этого точно не знаю», "
         "`not_found` — экспонат не найден в каталоге, `error` — сбой LLM.\n\n"
+        "Разница между `llm_refusal` и `llm_hedge` не косметическая: только первая "
+        "причина (вместе с `no_context`) убирает вопрос из подсказок гида у всех "
+        "посетителей экспоната. `llm_hedge` — сигнал «описание стоит дополнить», "
+        "а не «вопрос плохой».\n\n"
         "Вопросы сгруппированы тем же кластеризатором, что и `/analytics/questions`, "
         "и привязаны к экспонатам из контекста запроса. Сообщения, накопленные до "
         "03.08.2026, признака не имеют и попадают в `unclassified` "

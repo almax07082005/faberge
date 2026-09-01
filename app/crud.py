@@ -1,6 +1,7 @@
 """Запросы к БД и сериализация ORM → Pydantic."""
 from __future__ import annotations
 
+import logging
 import statistics
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
@@ -25,7 +26,9 @@ from sqlalchemy.orm import selectinload
 from . import models as m
 from . import schemas as sch
 from .config import settings
-from .services import question_cluster, visits
+from .services import catalog_line, location, question_cluster, visits
+
+logger = logging.getLogger(__name__)
 
 
 # ── Сериализаторы ────────────────────────────────────────────────────────────
@@ -55,6 +58,49 @@ def to_showcase(s: m.Showcase, exhibit_count: Optional[int] = None) -> sch.Showc
     )
 
 
+def to_exhibit_location(e: m.Exhibit) -> sch.ExhibitLocation:
+    """Расположение экспоната: структура + готовая фраза (баг-репорт 31.08.2026, п. I-2).
+
+    Единственная точка, где ORM превращается в расположение, — иначе карточка,
+    список и ответ гида разъедутся формулировками. Сам текст фразы живёт в
+    `app/services/location.py`, здесь только привязка данных.
+
+    Экспонат без витрины (`showcase_id IS NULL` — на проде такие есть, ср.
+    `scripts/fix_showcase_orphans.py`) даёт ПУСТОЙ объект, а не `None`: набор ключей
+    в ответе не должен зависеть от полноты данных — это и есть «прогнозируемость»
+    в терминах музея.
+    """
+    if e.showcase is None:
+        return sch.ExhibitLocation()
+    hall = e.showcase.hall
+    numbers = dict(
+        hall_number=hall.hall_number if hall is not None else None,
+        hall_name=hall.name if hall is not None else None,
+        showcase_number=e.showcase.showcase_number,
+    )
+    return sch.ExhibitLocation(
+        hall_id=hall.id if hall is not None else None,
+        showcase_id=e.showcase.id,
+        showcase_name=e.showcase.name,
+        # Витрина-сирота (зала нет) начинает фразу сразу с витрины; флагом, а не
+        # выводом из полей — так же, как в `guide._location_phrase`.
+        text=location.location_phrase(**numbers, case="nom", capitalize=True, has_hall=hall is not None),
+        text_in=location.location_phrase(**numbers, case="prep", has_hall=hall is not None),
+        **numbers,
+    )
+
+
+def to_exhibit_maker(e: m.Exhibit) -> sch.ExhibitMaker:
+    """«Фирма и мастер» из одного поля `master_name` (баг-репорт 31.08.2026, п. I-2).
+
+    Разбор ПРОИЗВОДНЫЙ и считается здесь, при сериализации: колонок под фирму и
+    мастера в схеме нет и заводить их нельзя — см. докстринг
+    `catalog_line.split_maker` и docs/task-2026-08-31-exhibit-card.md.
+    """
+    parts = catalog_line.split_maker(e.master_name)
+    return sch.ExhibitMaker(text=parts.text, firm=parts.firm, master=parts.master)
+
+
 def to_exhibit_summary(e: m.Exhibit) -> sch.ExhibitSummary:
     hall = e.showcase.hall if e.showcase else None
     return sch.ExhibitSummary(
@@ -62,47 +108,64 @@ def to_exhibit_summary(e: m.Exhibit) -> sch.ExhibitSummary:
         exhibit_number=e.exhibit_number,
         label_slug=e.label_slug,
         name=e.name,
-        year_created=e.year_created,
-        master_name=e.master_name,
         thumbnail_url=e.image_url,
+        location=to_exhibit_location(e),
         hall_id=hall.id if hall else None,
         showcase_id=e.showcase_id,
         showcase_number=e.showcase.showcase_number if e.showcase else None,
+        year_created=e.year_created,
+        maker=to_exhibit_maker(e),
+        master_name=e.master_name,
         is_temporary=hall.is_temporary if hall else None,
     )
 
 
 def to_exhibit(e: m.Exhibit, admin: bool = False) -> sch.Exhibit:
     hall = to_hall_brief(e.showcase.hall) if e.showcase and e.showcase.hall else None
-    showcase = sch.ShowcaseBrief(id=e.showcase.id, showcase_number=e.showcase.showcase_number) if e.showcase else None
+    showcase = (
+        sch.ShowcaseBrief(id=e.showcase.id, showcase_number=e.showcase.showcase_number, name=e.showcase.name)
+        if e.showcase
+        else None
+    )
     images = [
         sch.Image(id=i.id, url=i.url, alt=i.alt, width=i.width, height=i.height, is_primary=i.is_primary)
         for i in e.images
     ]
     cls = sch.ExhibitAdmin if admin else sch.Exhibit
+    # Порядок ключей повторяет порядок полей схемы, заданный музеем 31.08.2026:
+    # название, изображение, расположение, датировка, фирма и мастер, материалы,
+    # техники, описание. Читать словарь и схему рядом должно быть легко.
     data = dict(
         id=e.id,
         exhibit_number=e.exhibit_number,
         label_slug=e.label_slug,
         name=e.name,
+        image_url=e.image_url,
+        images=images,
+        location=to_exhibit_location(e),
+        hall=hall,
+        showcase=showcase,
         year_created=e.year_created,
+        origin_place=e.origin_place,
+        maker=to_exhibit_maker(e),
         master_name=e.master_name,
         material=e.material,
         techniques=e.techniques,
         short_description=e.short_description,
-        image_url=e.image_url,
-        images=images,
         video_url=e.video_url,
         model_3d_url=e.model_3d_url,
         model_3d_embed=e.model_3d_embed,
         audio_url=e.audio_url,
         source_url=e.source_url,
-        hall=hall,
-        showcase=showcase,
     )
     if admin:
         data["raw_history"] = e.raw_history
         data["short_description_spoken"] = e.short_description_spoken
+        # Колонка и триггер `trg_exhibits_updated` есть с самого начала, но наружу
+        # время правки не отдавалось — из-за этого при разборе потерь 31.08.2026
+        # нельзя было отличить карточку, испорченную вчера, от испорченной месяц
+        # назад. Только в админском представлении: посетителю это не нужно.
+        data["updated_at"] = e.updated_at
     return cls(**data)
 
 
@@ -140,14 +203,24 @@ def to_referenced_hall(h: m.Hall) -> sch.ReferencedHall:
 
 
 def to_location(e: m.Exhibit) -> Optional[sch.GuideLocation]:
-    """Навигация «зал + витрина» (B7). None, если экспонат не привязан к витрине."""
+    """Навигация «зал + витрина» (B7). None, если экспонат не привязан к витрине.
+
+    Семантику «None у непривязанного экспоната» не меняем — на неё смотрит ветка B7
+    в `app/routers/guide.py`. А вот текст фразы с 31.08.2026 берём из общего
+    `to_exhibit_location`: у гида и у карточки предмета расположение обязано
+    называться одними и теми же словами.
+    """
     if e.showcase is None:
         return None
-    hall = e.showcase.hall
+    where = to_exhibit_location(e)
     return sch.GuideLocation(
-        hall_number=hall.hall_number if hall else None,
-        hall_name=hall.name if hall else None,
-        showcase_number=e.showcase.showcase_number,
+        hall_number=where.hall_number,
+        hall_name=where.hall_name,
+        showcase_number=where.showcase_number,
+        hall_id=where.hall_id,
+        showcase_id=where.showcase_id,
+        text=where.text,
+        text_in=where.text_in,
     )
 
 
@@ -190,9 +263,13 @@ async def _showcase_exhibit_counts(session: AsyncSession, showcase_ids: Sequence
 
 # ── Карта / навигация ────────────────────────────────────────────────────────
 # Порядок залов: sort_order, затем номер. Залы без номера («Вне постоянной
-# экспозиции») идут последними — nullslast. Служебные записи (Парадная лестница)
+# экспозиции») идут последними — nullslast. Служебные/технические записи каталога
 # в публичную выдачу не попадают: источник правды один, скрывать их на клиенте
 # нельзя (баг-репорт 28.07.2026, п.5).
+# С 31.08.2026 «Парадная лестница» под этот фильтр НЕ подпадает: музей отменил п.5
+# и просит её первым залом основной экспозиции (п. I-1) — см.
+# docs/staircase-hall-decision.md. Сам механизм скрытия остаётся для будущих
+# служебных записей; изменилось состояние одной строки, а не правило.
 _HALL_ORDER = (m.Hall.sort_order, nullslast(m.Hall.hall_number.asc()))
 # Витрины: по номеру, а группа «не в витринах» (showcase_number IS NULL) — последней.
 _SHOWCASE_ORDER = nullslast(m.Showcase.showcase_number.asc())
@@ -495,11 +572,15 @@ async def search_halls_orm(
 ) -> List[m.Hall]:
     """ORM-залы по запросу: FTS-ранжирование + ILIKE-подстрока.
 
-    Служебные залы (Парадная лестница) по умолчанию скрыты — как в /halls, /map и
-    у гида: это была единственная выборка залов без фильтра видимости, и поиск
-    отдавал посетителю зал, которого нет в списке залов (баг-репорт 12.08.2026;
-    на проде GET /search?q=Парадная лестница возвращал зал 1). Флаг include_service
-    оставлен для админских сценариев, где служебные записи нужно видеть.
+    Служебные записи каталога по умолчанию скрыты — как в /halls, /map и у гида:
+    это была единственная выборка залов без фильтра видимости, и поиск отдавал
+    посетителю зал, которого нет в списке залов (баг-репорт 12.08.2026; на проде
+    GET /search?q=Парадная лестница возвращал зал 1, тогда ещё служебный). Флаг
+    include_service оставлен для админских сценариев, где такие записи нужно видеть.
+
+    С 31.08.2026 «Парадная лестница» служебной не считается (п. I-1, см.
+    docs/staircase-hall-decision.md), поэтому поиск отдаёт её снова — и теперь это
+    правильно: зал есть и в GET /halls.
     """
     tsq = _ru_tsquery(q)
     stmt = (
@@ -540,8 +621,10 @@ async def exhibits_by_number(session: AsyncSession, number: str) -> List[m.Exhib
 async def all_halls_ordered(session: AsyncSession, include_service: bool = False) -> List[m.Hall]:
     """Залы в порядке каталога (B10): для ответа «какие залы есть».
 
-    Служебные записи (Парадная лестница) по умолчанию исключены — гид не должен
-    называть их посетителю, а «В музее N залов» обязан сойтись с GET /halls.
+    Служебные записи каталога по умолчанию исключены — гид не должен называть их
+    посетителю, а «В музее N залов» обязан сойтись с GET /halls. Именно поэтому
+    снятие флага у «Парадной лестницы» 31.08.2026 (п. I-1) само, без правок кода,
+    превратило «11 залов» в «12 залов»: счётчик считает то же, что показывает список.
     """
     stmt = _hall_visibility(select(m.Hall).order_by(*_HALL_ORDER), None, include_service)
     return list((await session.execute(stmt)).scalars().all())
@@ -607,6 +690,116 @@ async def save_exhibit_questions(
     )
     await session.execute(stmt)
     await session.commit()
+
+
+# ── Память о заданных вопросах и отказах (баг-репорт 31.08.2026, п. II-3) ────
+# Новой таблицы под «память» нет и не нужно: guide_messages с 03.08.2026 хранит
+# ровно то, что требуется, — формулировку вопроса (role='user'), признак
+# `answered`, причину `fail_reason` и экспонат, у которого спрашивали. Здесь
+# только два запроса-чтения; решение «что из этого прятать» принимает
+# services/guide_questions.
+
+# Сколько последних реплик сессии поднимать. Диалог у витрины — это единицы
+# вопросов; 50 покрывает даже самого дотошного посетителя, а верхняя граница
+# нужна, чтобы одна бесконечная сессия не тянула в память весь свой хвост.
+SESSION_MEMORY_LIMIT = 50
+# Сколько отказных строк по одному экспонату читать. Порог отсекается уже в SQL
+# (HAVING), лимит здесь — страховка от карточки, вокруг которой накопились сотни
+# разных неудачных формулировок.
+REFUSAL_SCAN_LIMIT = 200
+
+
+async def session_asked_questions(
+    session: AsyncSession, session_id, limit: int = SESSION_MEMORY_LIMIT
+) -> List[Tuple[str, Optional[bool], Optional[str], Optional[int]]]:
+    """Что посетитель уже спрашивал в ЭТОЙ сессии: (текст, answered, fail_reason, exhibit_id).
+
+    `exhibit_id` возвращается, потому что исключать вопрос надо у ТОГО предмета,
+    у которого его задали. Пулы подсказок у соседних яиц похожи дословно («Кому
+    подарили это яйцо?»), и без привязки посетитель, идущий по залу, к третьей
+    витрине остался бы вообще без хороших подсказок — вместо починки п. II-2 мы
+    получили бы новую его разновидность. Реплики общего чата (`exhibit_id IS
+    NULL`) исключаются везде: они не про предмет.
+
+    Это НЕ история для промпта. Историю роутер поднимает хвостом в
+    `GUIDE_HISTORY_TURNS` реплик (по умолчанию 3) — в модель всё равно уходит
+    только хвост. Для подсказок нужен весь список: иначе из блока исчезали бы
+    лишь три последних вопроса, а четвёртый по счёту предлагался бы заново —
+    ровно то «бесконечное перефразирование», на которое жалуется музей (п. II-2).
+
+    Идём по `idx_guide_messages_sess`, ORDER BY id DESC: порядок для отбора не
+    важен (все строки попадают в один список исключений), важно взять последние.
+    """
+    rows = (
+        await session.execute(
+            select(
+                m.GuideMessage.content,
+                m.GuideMessage.answered,
+                m.GuideMessage.fail_reason,
+                m.GuideMessage.exhibit_id,
+            )
+            .where(m.GuideMessage.session_id == session_id, m.GuideMessage.role == "user")
+            .order_by(m.GuideMessage.id.desc())
+            .limit(max(0, limit))
+        )
+    ).all()
+    return [(content, answered, fail_reason, exhibit_id) for content, answered, fail_reason, exhibit_id in rows]
+
+
+async def exhibit_refused_questions(
+    session: AsyncSession,
+    exhibit_id: int,
+    min_count: int = 2,
+    days: int = 90,
+    limit: int = REFUSAL_SCAN_LIMIT,
+) -> List[str]:
+    """Формулировки, на которые гид уже отказался отвечать по ЭТОМУ экспонату.
+
+    Память глобальная, а не сессионная (решение Д8 по релизу 31.08.2026): музей
+    описал «принципиальные сбои в работе алгоритма», то есть вопрос, на который
+    гид не знает ответа, не должен предлагаться НИКОМУ, а не только тому
+    посетителю, который уже обжёгся.
+
+    Что считается отказом: `fail_reason IN ('llm_refusal','no_context')` — гид
+    ответил, но по сути сказал «не знаю», и сказал это ЦЕЛИКОМ (роутер ставит эти
+    причины по строгому `guide_intel.is_hard_refusal`). Три другие причины сюда
+    НЕ входят, и каждая по своей причине:
+      • `'error'` — сбой сети, роутер пишет его перед 502; провал
+        инфраструктуры, а не отсутствие ответа;
+      • `'not_found'` — навигация не нашла предмет; провал поиска;
+      • `'llm_hedge'` — содержательный ответ, в котором модель честно
+        оговорилась («точной даты не знаю»). Промпт диалога сам просит так
+        писать, и прятать из-за оговорки нормальный вопрос у ВСЕХ посетителей
+        было бы наказанием за требуемое поведение.
+    Все три остаются в отчёте `/admin/analytics/unanswered` — там ширина полезна.
+
+    Группируем по ДОСЛОВНОЙ формулировке (trim), и это не приближение:
+    отказавший вопрос посетитель обычно не печатает руками, а тапает в блоке
+    подсказок, то есть текст приходит буква в букву из того же кэшированного
+    пула. Перефразировки добирает уже вызывающий код — сравнением по смыслу
+    (`guide_style.dedupe_questions`), в которое этот список уходит как `exclude`.
+    """
+    trimmed = func.trim(m.GuideMessage.content)
+    conds = [
+        m.GuideMessage.role == "user",
+        m.GuideMessage.answered.is_(False),
+        m.GuideMessage.fail_reason.in_(("llm_refusal", "no_context")),
+        m.GuideMessage.exhibit_id == exhibit_id,
+        func.length(trimmed) > 0,
+    ]
+    if days > 0:
+        conds.append(m.GuideMessage.created_at >= datetime.now(timezone.utc) - timedelta(days=days))
+    rows = (
+        await session.execute(
+            select(trimmed.label("question"), func.count().label("refusals"))
+            .where(and_(*conds))
+            .group_by(trimmed)
+            .having(func.count() >= max(1, min_count))
+            .order_by(func.count().desc())
+            .limit(max(0, limit))
+        )
+    ).all()
+    return [question for question, _refusals in rows]
 
 
 async def exhibit_questions_coverage(session: AsyncSession, language: str = "ru") -> Tuple[int, int]:
@@ -824,16 +1017,129 @@ async def create_exhibit(session: AsyncSession, data: sch.ExhibitCreate) -> m.Ex
     return await get_exhibit_orm(session, ex.id)  # type: ignore[return-value]
 
 
-async def replace_exhibit(session: AsyncSession, ex: m.Exhibit, data: sch.ExhibitUpdate) -> m.Exhibit:
-    for field, value in data.model_dump().items():
+def _is_blank(value: object) -> bool:
+    """Пустое значение поля карточки: None или строка из одних пробелов.
+
+    Пустую строку считаем потерей наравне с NULL: в карточке «описание есть, но
+    оно пустое» и «описания нет» для посетителя одно и то же.
+    """
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _warn_on_wipe(ex: m.Exhibit, payload: Dict[str, object], source: str) -> List[str]:
+    """Предупредить в лог, что правка обнуляет РАНЕЕ НЕПУСТЫЕ поля карточки.
+
+    Ровно этой строки не хватило 31.08.2026: PUT молча стирал `image_url`,
+    `short_description` и `material`, и потерю заметил музей на своей карточке, а
+    не мы — причём неизвестно, через сколько времени после самой правки. Мутирующие
+    ручки админки не пишут в лог ничего, аудита правок в схеме нет — предупреждение
+    здесь единственное место, где ещё видно И старое значение из ORM, И новое из
+    запроса (в роутере старого уже не будет).
+
+    Значения полей в лог НЕ пишем — описания длинные, а в логи функции они
+    попадают целиком; для разбора достаточно id карточки и имён полей.
+    Возвращает список имён, чтобы вызывающий мог решить, чинить ли потерю
+    (см. `_restore_primary_image`), а тест — проверить факт без разбора текста.
+    """
+    wiped = [
+        field for field, value in payload.items()
+        if _is_blank(value) and not _is_blank(getattr(ex, field, None))
+    ]
+    if wiped:
+        logger.warning("exhibit_update: %s id=%s очищает непустые поля: %s", source, ex.id, ", ".join(wiped))
+    return wiped
+
+
+def _restore_primary_image(ex: m.Exhibit, provided: Optional[Set[str]] = None) -> bool:
+    """Вернуть `image_url` из галереи, если он опустел ПОБОЧНО, а первичное фото цело.
+
+    `exhibits.image_url` — не самостоятельное поле, а зеркало строки
+    `exhibit_images` с `is_primary`: `add_exhibit_image` пишет их вместе, а
+    `delete_exhibit_image` вместе же и снимает. Значит «image_url пуст, а в
+    галерее есть первичное фото» — состояние, недостижимое штатным путём; именно
+    его и оставлял после себя PUT. Восстановление ничего не выдумывает: берём URL
+    из той же строки, которая его туда и положила.
+
+    `provided` — имена полей, ЯВНО пришедших в теле запроса (`model_fields_set`).
+    Если `image_url` в теле был, лечение не применяется вовсе: раз админ прислал
+    поле руками, значение выбрал он, и `{"image_url": null}` обязан очистить поле.
+    Без этого проверки лечение отменяло бы и осознанную очистку — то есть ровно
+    то, что обещают описания PUT/PATCH в openapi.yaml («чтобы очистить поле,
+    пришлите явный `null`»), стало бы невыполнимым, а у PATCH — ещё и пропала бы
+    рабочая операция «снять главное фото, оставив снимок в галерее».
+    Лечение карточек, испорченных ПОСТОРОННИМ сохранением, при этом остаётся:
+    там `image_url` в теле нет.
+
+    Несколько первичных строк (или ни одной) — случай неоднозначный, там не
+    угадываем и пишем предупреждение.
+
+    Требует загруженной коллекции `ex.images` (её даёт `_EXHIBIT_FULL`, по которому
+    обе ручки и читают карточку).
+    """
+    if provided is not None and "image_url" in provided:
+        return False
+    if not _is_blank(ex.image_url):
+        return False
+    primary = [img for img in ex.images if img.is_primary and not _is_blank(img.url)]
+    if len(primary) != 1:
+        if primary:
+            logger.warning("exhibit_update: id=%s image_url пуст, но первичных фото %s — не восстанавливаем", ex.id, len(primary))
+        return False
+    ex.image_url = primary[0].url
+    logger.warning("exhibit_update: id=%s image_url восстановлен из галереи (is_primary)", ex.id)
+    return True
+
+
+async def replace_exhibit(
+    session: AsyncSession, ex: m.Exhibit, data: sch.ExhibitUpdate, *, full_replace: bool = False
+) -> m.Exhibit:
+    """PUT карточки: по умолчанию поля, которых НЕ БЫЛО в теле, не трогаем.
+
+    Прежнее `data.model_dump()` отдавало все поля схемы, включая незаполненные
+    дефолты `None`, и любое поле, отсутствующее в теле запроса, молча затирало
+    содержимое БД. Админка присылает форму частично (набор уцелевших полей у
+    испорченных карточек совпадает с `ExhibitSummary` поле в поле) — так музей и
+    потерял изображения с описаниями, правя техники у яйца «Ренессанс».
+
+    «Не прислали» от «прислали явный null» отличаем через `model_fields_set` —
+    тем же механизмом, что уже работает в `admin._autofill_spoken`. Явный `null`
+    поле по-прежнему стирает: осознанная очистка остаётся возможной.
+
+    `full_replace=True` возвращает старую семантику «чего нет в теле — обнуляется».
+    Оставлен как явный опт-ин для скриптов, которые сознательно перезаписывают
+    карточку целиком: контракт остаётся честным, но разрушительное поведение
+    перестаёт быть значением по умолчанию.
+
+    В `_restore_primary_image` уходит `model_fields_set`, а НЕ ключи `payload`:
+    при `full_replace` в `payload` попадают все поля схемы, и по нему нельзя
+    отличить «админ прислал image_url» от «поле подставил дамп». Про осознанность
+    очистки честно отвечает только тело запроса.
+    """
+    payload = data.model_dump() if full_replace else data.model_dump(exclude_unset=True)
+    _warn_on_wipe(ex, payload, "PUT")
+    for field, value in payload.items():
         setattr(ex, field, value)
+    _restore_primary_image(ex, data.model_fields_set)
     await session.commit()
     return await get_exhibit_orm(session, ex.id)  # type: ignore[return-value]
 
 
 async def patch_exhibit(session: AsyncSession, ex: m.Exhibit, data: sch.ExhibitPatch) -> m.Exhibit:
-    for field, value in data.model_dump(exclude_unset=True).items():
+    """PATCH карточки: пишем только переданные поля (семантика не менялась).
+
+    Предупреждение о затирании нужно и здесь: `{"short_description": null}`
+    стирает описание так же необратимо, как это делал PUT. Если оставить лог
+    только на PUT, следующая потеря придёт через PATCH и снова останется незамеченной.
+
+    Лечение `image_url` из галереи тоже стоит и здесь — но только когда поля в
+    теле не было. `PATCH {"image_url": null}` был и остаётся рабочим способом
+    снять главное фото, не трогая галерею; отменять его «лечением» нельзя.
+    """
+    payload = data.model_dump(exclude_unset=True)
+    _warn_on_wipe(ex, payload, "PATCH")
+    for field, value in payload.items():
         setattr(ex, field, value)
+    _restore_primary_image(ex, data.model_fields_set)
     await session.commit()
     return await get_exhibit_orm(session, ex.id)  # type: ignore[return-value]
 

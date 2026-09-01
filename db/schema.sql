@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS halls (
     level           INT,                        -- этаж/уровень в здании
     cover_image_url TEXT,
     is_temporary    BOOLEAN NOT NULL DEFAULT false,  -- зал временной выставки (vs основная экспозиция)
-    is_service      BOOLEAN NOT NULL DEFAULT false,  -- служебная запись (Парадная лестница): скрыта из публичной выдачи
+    is_service      BOOLEAN NOT NULL DEFAULT false,  -- служебная запись каталога (технические залы): скрыта из публичной выдачи
+                                                     -- «Парадная лестница» была такой с 29.07 по 31.08.2026 — решение отменено,
+                                                     -- см. docs/staircase-hall-decision.md и db/migrations/2026-08-31_staircase_public.sql
     sort_order      INT NOT NULL DEFAULT 0,     -- порядок вывода залов в каталоге/админке (drag-n-drop)
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -96,6 +98,10 @@ CREATE TABLE IF NOT EXISTS exhibits (
     -- с колонкой-дублем dating; теперь поле датировки одно (таска 17.08.2026,
     -- миграция 2026-08-17_year_created_text.sql).
     year_created      TEXT,
+    -- Место создания дословно как в путеводителе («Санкт-Петербург», «Швейцария,
+    -- Женева»): музей просит показывать его рядом с датой (баг-репорт 31.08.2026,
+    -- п. I-2). Парсер каталожной строки место извлекал и раньше, колонки не было.
+    origin_place      TEXT,
     master_name       VARCHAR(255),
     material          VARCHAR(255),
     -- Техники (хвост каталожной строки после «;»): «штамп, чеканка, эмаль по гильошированному фону».
@@ -129,6 +135,9 @@ ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS short_description_spoken TEXT;
 ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS exhibit_number VARCHAR(32);
 ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS video_url TEXT;
 ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS techniques TEXT;
+-- Место создания (баг-репорт 31.08.2026, п. I-2): db/migrations/2026-08-31_exhibit_origin_place.sql.
+-- Заполняет колонку не миграция, а обратимый бэкфилл scripts/backfill_exhibit_origin_place.py.
+ALTER TABLE exhibits ADD COLUMN IF NOT EXISTS origin_place TEXT;
 -- year_created INTEGER → TEXT (+ перенос данных из бывшей колонки dating) для живой БД
 -- делает db/migrations/2026-08-17_year_created_text.sql — идемпотентным ALTER'ом это не
 -- выражается, а на чистой базе колонка сразу TEXT (CREATE TABLE выше).
@@ -202,8 +211,13 @@ CREATE TABLE IF NOT EXISTS guide_messages (
     -- Пишется на ОБЕ строки пары (вопрос и ответ), чтобы отчёт «вопросы без
     -- ответа» читал role='user' без self-join.
     answered    BOOLEAN,
+    -- Причина, по которой ответа не получилось. 'llm_hedge' (31.08.2026) — это
+    -- НЕ отказ, а содержательный ответ с оговоркой «этого точно не знаю»:
+    -- отдельная причина нужна потому, что 'llm_refusal'/'no_context' кормят
+    -- глобальную память отказов (app/crud.py: exhibit_refused_questions) и
+    -- прячут вопрос из подсказок у всех посетителей — см. guide_intel.is_hard_refusal.
     fail_reason VARCHAR(32) CHECK (fail_reason IS NULL OR fail_reason IN
-                     ('no_context', 'llm_refusal', 'not_found', 'error')),
+                     ('no_context', 'llm_refusal', 'llm_hedge', 'not_found', 'error')),
     -- Контекст вопроса: у какого экспоната/зала посетитель спрашивал.
     exhibit_id  INT,
     hall_id     INT,
@@ -236,7 +250,8 @@ ALTER TABLE guide_messages ADD COLUMN IF NOT EXISTS exhibit_id  INT;
 ALTER TABLE guide_messages ADD COLUMN IF NOT EXISTS hall_id     INT;
 ALTER TABLE guide_messages DROP CONSTRAINT IF EXISTS guide_messages_fail_reason_chk;
 ALTER TABLE guide_messages ADD CONSTRAINT guide_messages_fail_reason_chk
-    CHECK (fail_reason IS NULL OR fail_reason IN ('no_context', 'llm_refusal', 'not_found', 'error'));
+    CHECK (fail_reason IS NULL OR fail_reason IN
+           ('no_context', 'llm_refusal', 'llm_hedge', 'not_found', 'error'));
 ALTER TABLE events ADD COLUMN IF NOT EXISTS showcase_id INT;
 ALTER TABLE events ADD COLUMN IF NOT EXISTS device_id   UUID;
 
@@ -285,6 +300,15 @@ CREATE INDEX IF NOT EXISTS idx_events_hall_type     ON events(hall_id, type)    
 CREATE INDEX IF NOT EXISTS idx_events_showcase      ON events(showcase_id) WHERE showcase_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_guide_messages_unanswered
     ON guide_messages(created_at) WHERE answered IS FALSE AND role = 'user';
+-- Память об отказах (баг-репорт 31.08.2026, п. II-3): вопрос, на который гид уже
+-- не смог ответить по ЭТОМУ экспонату, больше не предлагается в подсказках.
+-- Запрос идёт на КАЖДОЙ реплике диалога об экспонате, а guide_messages не
+-- чистится и растёт линейно от посещаемости — без индекса это полный скан на
+-- каждый вопрос посетителя. idx_guide_messages_unanswered здесь не помогает:
+-- он ведёт по created_at, а нам нужен вход по конкретному exhibit_id.
+CREATE INDEX IF NOT EXISTS idx_guide_messages_refused
+    ON guide_messages(exhibit_id, created_at)
+    WHERE role = 'user' AND answered IS FALSE AND exhibit_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_analytics_daily_metric   ON analytics_daily(metric, date);
 CREATE INDEX IF NOT EXISTS idx_analytics_reports_updated ON analytics_reports(updated_at);
 CREATE INDEX IF NOT EXISTS idx_halls_name_trgm      ON halls    USING gin (name gin_trgm_ops);

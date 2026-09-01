@@ -40,10 +40,16 @@ def live(hall_id: int, number, name: str, description=None, is_service: bool = F
 
 
 def prod_halls() -> list:
-    """GET /halls?include_service=true, как он отвечает на проде.
+    """GET /halls?include_service=true, как он отвечал на проде 12.08.2026.
 
     Ключевое: id 14 «Голубая гостиная» стоит под №8, а Выставочный (id 8) уехал на №9 —
     и дальше по списку каждый зал на единицу больше своего номера в старом сиде.
+
+    Снимок датирован 12.08.2026 и намеренно не обновляется: на 31.08.2026 у зала 1
+    флаг is_service уже снят (музей отменил решение, п. I-1, см.
+    docs/staircase-hall-decision.md). Тесты ниже проверяют СВОЙСТВО скрипта — «не
+    читать урезанный список залов», — а оно остаётся верным для любой служебной
+    записи, которая появится в каталоге завтра.
     """
     return [
         live(1, 1, "Парадная лестница", "Сохранившаяся до наших дней…", is_service=True),
@@ -129,7 +135,7 @@ def _rollback_path() -> str:
 
 def _args(**over):
     """Аргументы CLI со значениями по умолчанию — для прогона run() без argparse."""
-    base = dict(rollback=None, apply=False, file=DESC_FILE,
+    base = dict(rollback=None, apply=False, file=DESC_FILE, only=None,
                 report_file=None, rollback_file=_rollback_path())
     base.update(over)
     return argparse.Namespace(**base)
@@ -198,7 +204,12 @@ def test_already_matching_description_is_idempotent():
 
 # ── Служебные залы ──────────────────────────────────────────────────────────────────────────
 def test_service_hall_is_fetched_only_with_the_flag():
-    """Зал №1 «Парадная лестница» служебный: без include_service его описание не залить никогда."""
+    """Служебный зал без include_service не залить никогда — на снимке 12.08.2026 это зал №1.
+
+    Проверяется свойство скрипта, а не сегодняшнее состояние прода: с 31.08.2026
+    «Парадная лестница» публичная (п. I-1), но следующая служебная запись потеряется
+    так же молча, если читать урезанный список.
+    """
     fake = FakeApi(prod_halls())
     fetched, _ = with_api(fake, halls.fetch_halls)
     assert 1 in [h["id"] for h in fetched]
@@ -333,6 +344,52 @@ def test_shipped_file_has_the_two_drawing_rooms_split():
     assert by_name["Белая гостиная"].description.startswith("Возрождение эмалевого дела")
     assert by_name["Голубая гостиная"].description.startswith("Иван Хлебников")
     assert "Рюкерта (1840–1917)" in by_name["Голубая гостиная"].description
+
+
+def test_staircase_description_covers_the_palace_and_the_museum():
+    """Зал №1 рассказывает о дворце и истории музея, а не только про перила (п. I-1 от 31.08.2026).
+
+    Музей просил дословно: «первым залом "Парадная лестница" с рассказом о дворце и
+    истории создания Музея». В старом тексте (1361 симв.) — архитектурная справка про
+    перила, купол и статую Аполлона: вхождений «фонд», «Вексельберг», «Форбс» было ноль.
+
+    Сверяем по СМЫСЛОВЫМ опорам, а не по точной формулировке: текст ещё вычитывает музей,
+    и переставлять слова он вправе. Но если после вычитки или переимпорта описаний из
+    путеводителя пропадут дворец и фонд — значит молча вернулась одна архитектурная
+    справка, и пункт снова не выполнен. Этот тест и есть сигнал о таком откате.
+    """
+    by_name = {e.name: e for e in halls.load_entries(DESC_FILE)}
+    text = by_name["Парадная лестница"].description
+
+    for marker in ("Шуваловск", "Связь времен", "Фаберже"):
+        assert marker in text, f"из описания зала №1 пропало упоминание «{marker}»"
+    assert len(text) > 1361, "описание не длиннее старой справки про лестницу — вступление потерялось"
+    # Абзац про саму лестницу никуда не делся: музей просил ДОБАВИТЬ рассказ, а не заменить.
+    assert "Парадная лестница с колоннами" in text
+
+    # Общие правила файла (см. test_shipped_file_has_the_two_drawing_rooms_split) — тоже в силе.
+    assert "\n\n" not in text and "\n" not in text
+    assert not text.startswith("Парадная лестница. ")
+
+
+def test_only_filter_narrows_the_run_to_named_halls():
+    """`--only «Парадная лестница»` заливает один зал, а опечатка в имени — падает громко.
+
+    Ключ нужен потому, что п.3 от 12.08 на проде так и не применён: прогон ради лестницы
+    (п. I-1) иначе потянул бы за собой чужие правки Белой и Голубой гостиных. Тихо вернуть
+    пустой план на опечатку нельзя — это выглядело бы как успешный прогон.
+    """
+    entries = file_entries()
+    only = halls.filter_entries(entries, ["парадная  ЛЕСТНИЦА"])   # регистр и пробелы не важны
+    assert [e.name for e in only] == ["Парадная лестница"]
+    assert halls.filter_entries(entries, None) == entries          # без ключа — всё как было
+
+    try:
+        halls.filter_entries(entries, ["Зал, которого нет"])
+    except SystemExit as exc:
+        assert "Зал, которого нет" in str(exc)
+    else:
+        raise AssertionError("опечатка в --only должна ронять прогон, а не давать пустой план")
 
 
 def normalized(name: str) -> str:

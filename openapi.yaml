@@ -210,6 +210,8 @@ paths:
         Полное дерево экспозиции для отрисовки интерактивной карты:
         залы с вложенными витринами и счётчиками экспонатов.
         Один запрос на загрузку карты на первом экране.
+        Описание зала приходит и полным (`description`), и превью
+        (`description_preview` + `description_has_more`) — см. `GET /halls/{hall_id}`.
       operationId: getMap
       security: []
       parameters:
@@ -230,7 +232,9 @@ paths:
       description: >-
         Постраничный список залов музея для карты и навигации. Служебные записи
         (`is_service`) в выдачу не попадают — источник правды один, скрывать их
-        на клиенте не нужно.
+        на клиенте не нужно. Описание зала приходит и полным (`description`), и
+        превью (`description_preview` + `description_has_more`) — см.
+        `GET /halls/{hall_id}`.
       operationId: listHalls
       security: []
       parameters:
@@ -255,6 +259,14 @@ paths:
       description: >-
         Карточка зала с описанием и кнопкой «Спросить AI-гида» на фронте.
         Описание зала используется на уровне зала интерактивной карты.
+
+
+        На первом экране показывается `description_preview`, а полный
+        `description` раскрывается кнопкой «Подробнее о зале» — её показывать,
+        только когда `description_has_more = true`. Так на одной странице видно
+        и что есть текст о зале, и что есть витрины: раньше описание занимало
+        весь экран и витрины уезжали за него (п. I-3 баг-репорта 31.08.2026).
+        Второго запроса раскрытие не требует — полный текст уже в ответе.
       operationId: getHall
       security: []
       parameters:
@@ -450,9 +462,28 @@ paths:
       tags: [Экспонаты]
       summary: Карточка экспоната
       description: >-
-        Полные данные карточки: фото, 3D-модель (Koinovo), краткое описание
-        (год, мастер, материалы), ссылки на зал и витрину. Поле `raw_history`
-        в публичный ответ не включается.
+        Полные данные карточки. Поле `raw_history` в публичный ответ не включается.
+
+
+        Состав и порядок полей музей задал дословно (баг-репорт 31.08.2026,
+        п. I-2): название предмета, изображение, расположение (название и номер
+        зала, номер витрины), год создания, фирма и мастер, материалы, техники,
+        описание. Ответ идёт ровно в этом порядке.
+
+
+        Что важно фронту:
+
+        • расположение приходит ГОТОВОЙ строкой в `location.text`
+        («Зал 4 «Синяя гостиная», витрина 5») — собирать его из `hall`/`showcase`
+        не нужно: ту же фразу печатает ИИ-гид, и две склейки разойдутся;
+
+        • `maker.text` всегда содержит полную строку «фирма и мастер» как её ведёт
+        музей, `maker.firm`/`maker.master` — её разобранные части (могут быть
+        `null`, тогда показывайте `maker.text`);
+
+        • набор ключей ПОСТОЯНЕН: пустое значение приходит как `null`, ключ не
+        исчезает, `location` и `maker` — всегда объекты. Проверки «а есть ли поле»
+        писать не нужно.
       operationId: getExhibit
       security: []
       parameters:
@@ -643,22 +674,37 @@ paths:
                       id: 101
                       label_slug: faberge_egg_coronation
                       name: Яйцо «Коронационное»
+                      image_url: https://cdn.example.cloud/exhibits/coronation/main.jpg
+                      location:
+                        hall_id: 4
+                        hall_number: 4
+                        hall_name: Синяя гостиная
+                        showcase_id: 12
+                        showcase_number: 5
+                        showcase_name: Пасхальные подарки
+                        text: Зал 4 «Синяя гостиная», витрина 5
+                        text_in: в зале 4 «Синяя гостиная», витрина 5
+                      hall:
+                        id: 4
+                        hall_number: 4
+                        name: Синяя гостиная
+                      showcase:
+                        id: 12
+                        showcase_number: 5
+                        name: Пасхальные подарки
                       year_created: '1897'
-                      master_name: Михаил Перхин
+                      origin_place: Санкт-Петербург
+                      maker:
+                        text: Фирма К. Фаберже, мастер М. Перхин
+                        firm: Фирма К. Фаберже
+                        master: мастер М. Перхин
+                      master_name: Фирма К. Фаберже, мастер М. Перхин
                       material: Золото, гильоше-эмаль, бриллианты, рубины
                       techniques: гравировка, канфарение, эмаль по гильошированному фону
                       short_description: >-
                         Пасхальное яйцо-сюрприз, подаренное Николаем II
                         императрице Александре Фёдоровне в память о коронации.
-                      image_url: https://cdn.example.cloud/exhibits/coronation/main.jpg
                       model_3d_url: https://koinovo.ru/fabergemuseum/coronation
-                      hall:
-                        id: 5
-                        hall_number: 5
-                        name: Синяя гостиная
-                      showcase:
-                        id: 12
-                        showcase_number: 3
                     candidates: []
                 not_recognized:
                   summary: Не распознано — есть кандидаты
@@ -740,10 +786,10 @@ paths:
                       В 1897 году Карл Фаберже исполнил для Николая II особый
                       пасхальный подарок императрице Александре Фёдоровне…
                     suggested_questions:
-                      - Сколько времени ушло на создание?
                       - Кому подарили это яйцо?
                       - Что за сюрприз спрятан внутри?
-                      - Какие материалы использовал мастер?
+                      - Из каких материалов он сделан?
+                      - Что известно о его владельцах?
                     audio_url: null
                     model: yandexgpt/latest
         '404':
@@ -805,6 +851,34 @@ paths:
                     context:
                       exhibit_id: 101
                       label_slug: faberge_egg_coronation
+                    referenced_exhibits:
+                      - id: 101
+                        name: Яйцо «Коронационное»
+                        exhibit_number: '12'
+                        thumbnail_url: https://cdn.example.cloud/exhibits/coronation/thumb.jpg
+                        hall_number: 4
+                        showcase_number: 5
+                        mentioned_in: context
+                    referenced_halls: []
+                    location: null
+                noMentions:
+                  summary: Ответ ни на один предмет каталога не ссылается — блок «Упомянуто в ответе» не показываем
+                  value:
+                    session_id: 2f6a9b3c-1d4e-4f8a-9c2b-5e7a1d0c3b66
+                    answer: >-
+                      Музей Фаберже открылся в Шуваловском дворце в 2013 году.
+                      Основу собрания составила коллекция Виктора Вексельберга…
+                    # Общий чат без контекста экспоната: подсказок здесь раньше
+                    # не было вовсе (п. II-7). Теперь отдаётся детерминированный
+                    # набор про музей — без обращения к модели.
+                    suggested_questions:
+                      - Какие залы есть в музее?
+                      - Что обязательно посмотреть в коллекции?
+                      - Чем знаменит Карл Фаберже?
+                    context: null
+                    referenced_exhibits: []
+                    referenced_halls: []
+                    location: null
         '404':
           $ref: '#/components/responses/NotFound'
         '422':
@@ -1246,12 +1320,46 @@ paths:
           $ref: '#/components/responses/NotFound'
     put:
       tags: [Администрирование]
-      summary: '[Вне MVP] Полностью обновить экспонат'
+      summary: '[Вне MVP] Обновить экспонат'
+      description: >-
+        Обновление карточки. Тело сливается с текущей карточкой: поле, которого
+        НЕТ в теле запроса, остаётся как было, а явный `null` поле стирает —
+        чтобы очистить описание или ссылку, пришлите `null`, а не пропустите поле.
+
+
+        До 31.08.2026 было наоборот: непереданное поле обнулялось. Админка
+        присылает форму частично, и правка техник у яйца «Ренессанс» унесла
+        изображение, описание и материалы (docs/task-2026-08-31-admin-put-data-loss.md).
+        Прежняя семантика полной замены доступна по `?full_replace=true`.
+
+
+        Отдельное правило для `image_url`: он — зеркало строки галереи с
+        `is_primary`, поэтому если поля в теле НЕТ, а в карточке оно пусто при
+        целой галерее, сервер вернёт URL оттуда (лечение карточек, испорченных
+        до 31.08.2026). Явно присланный `image_url` — в том числе `null` — это
+        лечение отключает и записывается как есть: очистить главное фото можно.
+        Правило действует и при `?full_replace=true`: `image_url` — единственное
+        поле, которое полная замена не обнуляет.
+
+
+        Если нужно поменять одно-два поля, правильнее `PATCH /admin/exhibits/{id}`.
       operationId: updateExhibit
       security:
         - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/ExhibitId'
+        - name: full_replace
+          in: query
+          required: false
+          description: >-
+            Полная замена: поля, которых нет в теле, обнуляются. По умолчанию
+            false — непереданные поля сохраняются. Исключение одно — `image_url`:
+            он зеркало строки галереи с `is_primary` и восстанавливается из неё
+            даже при полной замене; чтобы снять главное фото, пришлите
+            `image_url: null` явно.
+          schema:
+            type: boolean
+            default: false
       requestBody:
         required: true
         content:
@@ -1274,6 +1382,13 @@ paths:
     patch:
       tags: [Администрирование]
       summary: '[Вне MVP] Частично обновить экспонат'
+      description: >-
+        Частичное обновление: пишутся только переданные поля. Явный `null`
+        стирает поле — других способов очистить его нет, включая `image_url`
+        (`{"image_url": null}` снимает главное фото, оставляя снимок в галерее).
+        Если же `image_url` в теле НЕ передан, а в карточке он пуст при целой
+        галерее, сервер подставит URL строки с `is_primary` — то же лечение, что
+        и у `PUT`. Рекомендуемый способ правки карточки.
       operationId: patchExhibit
       security:
         - bearerAuth: []
@@ -1795,8 +1910,15 @@ paths:
         Показывает, чего не хватает в описаниях экспонатов. Признак `answered` и
         причина отказа проставляются в момент генерации ответа: `no_context` —
         не было справки, `llm_refusal` — модель отказалась при наличии
-        материалов, `not_found` — экспонат не найден в каталоге, `error` — сбой
-        LLM.
+        материалов, `llm_hedge` — ответила по существу, но с оговоркой «этого
+        точно не знаю», `not_found` — экспонат не найден в каталоге, `error` —
+        сбой LLM.
+
+
+        Разница между `llm_refusal` и `llm_hedge` не косметическая: только первая
+        причина (вместе с `no_context`) убирает вопрос из подсказок гида у всех
+        посетителей экспоната. `llm_hedge` — сигнал «описание стоит дополнить», а
+        не «вопрос плохой».
 
 
         Вопросы сгруппированы тем же кластеризатором, что и
@@ -2262,9 +2384,10 @@ components:
       in: query
       required: false
       description: >-
-        Включить служебные залы (`is_service`: Парадная лестница и т.п.). По
-        умолчанию `false` — посетителю такие записи не показываются. `true`
-        нужен админке, чтобы служебный зал оставался управляемым.
+        Включить служебные записи каталога (`is_service`) — технические залы и
+        вспомогательные пространства. По умолчанию `false` — посетителю такие
+        записи не показываются. `true` нужен админке, чтобы служебный зал
+        оставался управляемым.
       schema:
         type: boolean
         default: false
@@ -2277,7 +2400,7 @@ components:
       schema:
         type: integer
         minimum: 1
-      example: 5
+      example: 4
     ShowcaseId:
       name: showcase_id
       in: path
@@ -2426,11 +2549,13 @@ components:
     # ── Залы ──
     Hall:
       type: object
-      required: [id]
+      # description_preview/description_has_more считает бэкенд, поэтому в ответе
+      # они есть ВСЕГДА — как и в схеме, которую генерирует FastAPI.
+      required: [id, description_preview, description_has_more]
       properties:
         id:
           type: integer
-          example: 5
+          example: 4
         hall_number:
           type: integer
           nullable: true
@@ -2438,7 +2563,7 @@ components:
             Номер зала на плане экспозиции (уникальный). `null` — у зала номера
             нет («Вне постоянной экспозиции»): подпись строится только из
             названия, без «зал № …». Такие залы выводятся последними.
-          example: 5
+          example: 4
         name:
           type: string
           nullable: true
@@ -2474,9 +2599,13 @@ components:
           type: boolean
           default: false
           description: >-
-            Служебная запись каталога (Парадная лестница и т.п.). Такие залы не
-            попадают ни в `GET /halls`, ни на карту, ни в ответы гида — увидеть
-            их можно только с `?include_service=true` (нужно админке).
+            Служебная запись каталога — технические залы и вспомогательные
+            пространства. Такие залы не попадают ни в `GET /halls`, ни на карту,
+            ни в ответы гида — увидеть их можно только с
+            `?include_service=true` (нужно админке).
+            Зал №1 «Парадная лестница» был служебным с 29.07 по 31.08.2026;
+            с 31.08.2026 он — обычный первый зал основной экспозиции, и в
+            публичной выдаче стало 12 пронумерованных залов вместо 11.
           example: false
         sort_order:
           type: integer
@@ -2491,6 +2620,31 @@ components:
           type: integer
           nullable: true
           example: 24
+        description_preview:
+          type: string
+          nullable: true
+          readOnly: true
+          description: >-
+            Видимая часть текста о зале: начало `description`, обрезанное ПО
+            ГРАНИЦЕ ПРЕДЛОЖЕНИЯ (не по символу и не по слову) до
+            `HALL_DESCRIPTION_PREVIEW_CHARS` знаков — по умолчанию 350 при
+            описаниях в каталоге на 1,8–4,1 тыс. знаков. Полный текст никуда не
+            делся и лежит рядом в `description`: за раскрытием второй запрос не
+            нужен. `null` только если `null` само описание. Если превью
+            выключено (`HALL_DESCRIPTION_PREVIEW_CHARS=0`), равно `description`.
+          example: >-
+            Рыцарский зал был отделан по проекту Бернара де Симона 1844 года и
+            частично изменён в 1859 году Рудольфом Бернгардом.
+        description_has_more:
+          type: boolean
+          default: false
+          readOnly: true
+          description: >-
+            Есть ли что раскрывать: `true` — `description` длиннее превью,
+            показывать «Подробнее о зале»; `false` — описание уместилось целиком
+            (`description_preview == description`), кнопки быть не должно.
+            Признак считает бэкенд — фронту не нужно сравнивать строки.
+          example: true
 
     HallBrief:
       type: object
@@ -2499,12 +2653,12 @@ components:
       properties:
         id:
           type: integer
-          example: 5
+          example: 4
         hall_number:
           type: integer
           nullable: true
           description: '`null` — зал без номера («Вне постоянной экспозиции»).'
-          example: 5
+          example: 4
         name:
           type: string
           nullable: true
@@ -2568,7 +2722,7 @@ components:
           example: 12
         hall_id:
           type: integer
-          example: 5
+          example: 4
         showcase_number:
           type: integer
           nullable: true
@@ -2577,7 +2731,7 @@ components:
             группа «не в витринах»: в путеводителе она отмечена пустым
             квадратом, это экспонаты зала вне витрин. Такая группа в зале одна
             (попытка завести вторую → `409`) и выводится последней.
-          example: 3
+          example: 5
         name:
           type: string
           nullable: true
@@ -2589,7 +2743,8 @@ components:
 
     ShowcaseBrief:
       type: object
-      required: [id]
+      description: Краткая ссылка на витрину (для вложений в карточку экспоната).
+      required: [id, showcase_number, name]
       properties:
         id:
           type: integer
@@ -2598,7 +2753,14 @@ components:
           type: integer
           nullable: true
           description: '`null` — экспонат стоит вне витрин.'
-          example: 3
+          example: 5
+        name:
+          type: string
+          nullable: true
+          description: >-
+            Название витрины, если музей его ведёт. Добавлено 31.08.2026 (п. I-2):
+            без него нечем заполнить `ExhibitLocation.showcase_name`.
+          example: Пасхальные подарки
 
     ShowcaseDetail:
       allOf:
@@ -2606,7 +2768,10 @@ components:
         - type: object
           properties:
             hall:
-              $ref: '#/components/schemas/HallBrief'
+              allOf:
+                - $ref: '#/components/schemas/HallBrief'
+              nullable: true
+              description: 'Зал витрины; `null` — витрина не привязана к залу.'
             exhibits:
               type: array
               items:
@@ -2661,10 +2826,94 @@ components:
           description: Главное фото экспоната (= exhibits.image_url).
           example: true
 
+    ExhibitLocation:
+      type: object
+      description: >-
+        Готовое расположение предмета (п. I-2 баг-репорта 31.08.2026). Объект
+        присутствует ВСЕГДА; если экспонат не привязан к витрине, все поля `null`
+        — ключи при этом не исчезают. `text` — строка для показа
+        («Зал 4 «Синяя гостиная», витрина 5»), `text_in` — та же фраза в обороте
+        «Найти его можно в зале 4 «Синяя гостиная», витрина 5». Формулировка
+        совпадает с той, что печатает ИИ-гид (общий модуль `app/services/location.py`),
+        поэтому собирать её из `hall_*`/`showcase_*` на клиенте не нужно. Числа и
+        идентификаторы оставлены для ссылок «перейти в зал / в витрину».
+      required:
+        [hall_id, hall_number, hall_name, showcase_id, showcase_number, showcase_name, text, text_in]
+      properties:
+        hall_id:
+          type: integer
+          nullable: true
+          example: 4
+        hall_number:
+          type: integer
+          nullable: true
+          description: '`null` — зал без номера («Вне постоянной экспозиции»): в подписи только название.'
+          example: 4
+        hall_name:
+          type: string
+          nullable: true
+          example: Синяя гостиная
+        showcase_id:
+          type: integer
+          nullable: true
+          example: 12
+        showcase_number:
+          type: integer
+          nullable: true
+          description: '`null` — группа «не в витринах» (в путеводителе — пустой квадрат); в тексте это «вне витрин».'
+          example: 5
+        showcase_name:
+          type: string
+          nullable: true
+          description: Название витрины, если музей его ведёт.
+          example: Пасхальные подарки
+        text:
+          type: string
+          nullable: true
+          description: Готовая строка расположения для показа отдельной плашкой над названием.
+          example: Зал 4 «Синяя гостиная», витрина 5
+        text_in:
+          type: string
+          nullable: true
+          description: Та же фраза в предложном падеже — для оборота «Найти его можно …».
+          example: в зале 4 «Синяя гостиная», витрина 5
+
+    ExhibitMaker:
+      type: object
+      description: >-
+        Фирма и мастер (п. I-2 баг-репорта 31.08.2026). `text` — поле `master_name`
+        дословно, оно ВСЕГДА авторитетно и его достаточно для показа;
+        `firm`/`master` — его разобранные части (эвристика по формулировкам
+        путеводителя), обе `null`, если разобрать не удалось. Разбор производный:
+        источник правды в БД один — `master_name`, отдельных колонок под фирму и
+        мастера нет и они не планируются, пока музей не утвердит форму записи фирм.
+        Части возвращаются дословными подстроками `text`, вместе со словом-маркером
+        («Фирма», «Фабрика», «мастер») и кавычками источника.
+      required: [text, firm, master]
+      properties:
+        text:
+          type: string
+          nullable: true
+          example: Фирма К. Фаберже, мастер М. Перхин
+        firm:
+          type: string
+          nullable: true
+          example: Фирма К. Фаберже
+        master:
+          type: string
+          nullable: true
+          example: мастер М. Перхин
+
     ExhibitSummary:
       type: object
-      description: Краткое представление экспоната для списков и карусели.
-      required: [id, name]
+      description: >-
+        Краткое представление экспоната для списков, поиска и карусели. Порядок
+        свойств — тот же, что в `Exhibit` (см. его описание): плашка «зал/витрина»
+        над названием рисуется одинаково в каталоге и в карточке. Набор ключей
+        постоянен — пустое приходит как `null`, а не отсутствием ключа.
+      required:
+        [id, exhibit_number, label_slug, name, thumbnail_url, location, hall_id, showcase_id,
+         showcase_number, year_created, maker, master_name, is_temporary]
       properties:
         id:
           type: integer
@@ -2683,32 +2932,27 @@ components:
         name:
           type: string
           example: Яйцо «Коронационное»
-        year_created:
-          type: string
-          nullable: true
-          description: >-
-            Датировка как в путеводителе («1899–1903», «1890-е», «конец XIX
-            века») — подпись под названием берите отсюда. До 17.08.2026 поле
-            было числом (нижняя граница) и жило в паре с дублем `dating`;
-            теперь поле датировки одно. Техник (`techniques`) в списке нет —
-            они только в карточке `GET /exhibits/{id}`.
-          example: '1899–1903'
-        master_name:
-          type: string
-          nullable: true
-          example: Михаил Перхин
         thumbnail_url:
           type: string
           format: uri
           nullable: true
           example: https://cdn.example.cloud/exhibits/coronation/thumb.jpg
+        location:
+          allOf:
+            - $ref: '#/components/schemas/ExhibitLocation'
+          description: >-
+            Готовое расположение — то же самое, что в карточке. Добавлено
+            31.08.2026: раньше в списке был только `hall_id`, без названия зала,
+            и плашку «зал/витрина» собрать было не из чего.
         hall_id:
           type: integer
           nullable: true
-          example: 5
+          description: 'Дубль `location.hall_id`; оставлен для совместимости.'
+          example: 4
         showcase_id:
           type: integer
           nullable: true
+          description: 'Дубль `location.showcase_id`; оставлен для совместимости.'
           example: 12
         showcase_number:
           type: integer
@@ -2717,7 +2961,27 @@ components:
             Номер витрины экспоната (`null` — вне витрин). Отдаётся прямо в
             списке, чтобы группировку «витрина → её экспонаты» можно было
             собрать из одного ответа `GET /halls/{hall_id}/exhibits`.
-          example: 3
+            Дубль `location.showcase_number`.
+          example: 5
+        year_created:
+          type: string
+          nullable: true
+          description: >-
+            Датировка как в путеводителе («1899–1903», «1890-е», «конец XIX
+            века») — подпись под названием берите отсюда. До 17.08.2026 поле
+            было числом (нижняя граница) и жило в паре с дублем `dating`;
+            теперь поле датировки одно. Техник (`techniques`), материалов и
+            места создания в списке нет — они только в карточке `GET /exhibits/{id}`.
+          example: '1899–1903'
+        maker:
+          allOf:
+            - $ref: '#/components/schemas/ExhibitMaker'
+          description: Фирма и мастер разобранными частями; полная строка — в `maker.text`.
+        master_name:
+          type: string
+          nullable: true
+          description: 'Дубль `maker.text`; оставлен для совместимости.'
+          example: Фирма К. Фаберже, мастер М. Перхин
         is_temporary:
           type: boolean
           nullable: true
@@ -2732,7 +2996,27 @@ components:
       description: >-
         Полная карточка экспоната для публичного API. Внутреннее поле
         `raw_history` сюда не включается.
-      required: [id, name]
+
+
+        ПОРЯДОК СВОЙСТВ задан музеем дословно (баг-репорт 31.08.2026, п. I-2):
+        «название предмета, изображение, расположение (название и номер зала,
+        номер витрины), год создания, фирма и мастер, материалы, техники,
+        описание». Он воспроизведён и здесь, и в `app/schemas.py`, и в JSON
+        ответа — это контракт, а не оформление.
+
+
+        ПРОГНОЗИРУЕМОСТЬ (второе требование того же пункта): набор ключей
+        постоянен и не зависит от полноты данных — пустое приходит как `null`, а
+        не отсутствием ключа. Поэтому в `required` перечислены ВСЕ свойства, а
+        `location` и `maker` — всегда объекты, которые пустеют внутрь.
+
+
+        Свойства `hall`, `showcase` и `master_name` дублируют содержимое
+        `location`/`maker` и оставлены для уже задеплоенных клиентов.
+      required:
+        [id, exhibit_number, label_slug, name, image_url, images, location, hall, showcase,
+         year_created, origin_place, maker, master_name, material, techniques, short_description,
+         video_url, model_3d_url, model_3d_embed, audio_url, source_url]
       properties:
         id:
           type: integer
@@ -2750,6 +3034,39 @@ components:
         name:
           type: string
           example: Яйцо «Коронационное»
+        image_url:
+          type: string
+          format: uri
+          nullable: true
+          description: Главное изображение (Object Storage + CDN).
+          example: https://cdn.example.cloud/exhibits/coronation/main.jpg
+        images:
+          type: array
+          description: Галерея изображений (публичная, B4/C22).
+          items:
+            $ref: '#/components/schemas/Image'
+        location:
+          allOf:
+            - $ref: '#/components/schemas/ExhibitLocation'
+          description: >-
+            Расположение ГОТОВОЙ строкой (`location.text`) плюс структура для
+            ссылок. Собирать текст из `hall`/`showcase` не нужно — иначе
+            формулировка разойдётся с той, что говорит посетителю ИИ-гид.
+        hall:
+          allOf:
+            - $ref: '#/components/schemas/HallBrief'
+          nullable: true
+          description: >-
+            Зал экспоната; `null` — экспонат не привязан к витрине (зал
+            определяется через неё). Дубль `location.hall_*`, оставлен для
+            совместимости.
+        showcase:
+          allOf:
+            - $ref: '#/components/schemas/ShowcaseBrief'
+          nullable: true
+          description: >-
+            Витрина экспоната; `null` — экспонат не привязан к витрине. Дубль
+            `location.showcase_*`, оставлен для совместимости.
         year_created:
           type: string
           nullable: true
@@ -2760,10 +3077,28 @@ components:
             дублем `dating`: диапазон схлопывался в «1899», а вековая датировка
             пропадала совсем — теперь поле датировки одно (таска 17.08.2026).
           example: '1899–1903'
+        origin_place:
+          type: string
+          nullable: true
+          description: >-
+            Место создания дословно как в путеводителе — «Дата создания И МЕСТО»
+            со скриншота музея (31.08.2026, п. I-2). Колонка заведена
+            миграцией `db/migrations/2026-08-31_exhibit_origin_place.sql` и
+            заполняется обратимым бэкфиллом из каталожной строки
+            (`scripts/backfill_exhibit_origin_place.py`), поэтому у части карточек
+            она какое-то время будет `null`.
+          example: Санкт-Петербург
+        maker:
+          allOf:
+            - $ref: '#/components/schemas/ExhibitMaker'
+          description: >-
+            Фирма и мастер. Полная строка — в `maker.text` (она же `master_name`),
+            разобранные части — в `maker.firm`/`maker.master`.
         master_name:
           type: string
           nullable: true
-          example: Михаил Перхин
+          description: 'Дубль `maker.text`; оставлен для совместимости.'
+          example: Фирма К. Фаберже, мастер М. Перхин
         material:
           type: string
           nullable: true
@@ -2784,17 +3119,6 @@ components:
           example: >-
             Пасхальное яйцо-сюрприз, подаренное Николаем II императрице
             Александре Фёдоровне в память о коронации 1896 года.
-        image_url:
-          type: string
-          format: uri
-          nullable: true
-          description: Главное изображение (Object Storage + CDN).
-          example: https://cdn.example.cloud/exhibits/coronation/main.jpg
-        images:
-          type: array
-          description: Галерея изображений (публичная, B4/C22).
-          items:
-            $ref: '#/components/schemas/Image'
         video_url:
           type: string
           format: uri
@@ -2822,10 +3146,59 @@ components:
           nullable: true
           description: Первоисточник описания на сайте музея.
           example: https://fabergemuseum.ru/kollekczii/shedevryi-kollekczii/
+      # Пример ПОЛНЫЙ намеренно: в нём есть КАЖДЫЙ ключ из `required`, включая пустые
+      # (`model_3d_embed`, `audio_url` — `null`). Иначе он противоречил бы самой правке,
+      # ради которой затевался: фикстура, снятая с неполного примера, воспроизводит ту же
+      # непрогнозируемость («ключа нет» вместо `null`), от которой музей и просил уйти,
+      # а линтер спецификации падает на примере, не проходящем по собственному `required`.
+      # Порядок ключей — тот же, что у свойств выше: он тоже контракт.
+      example:
+        id: 101
+        exhibit_number: '12'
+        label_slug: faberge_egg_coronation
+        name: Яйцо «Коронационное»
+        image_url: https://cdn.example.cloud/exhibits/coronation/main.jpg
+        images:
+          - id: 1
+            url: https://cdn.example.cloud/exhibits/coronation/main.jpg
+            alt: Коронационное яйцо, общий вид
+            width: 1600
+            height: 1600
+            is_primary: true
+        location:
+          hall_id: 4
+          hall_number: 4
+          hall_name: Синяя гостиная
+          showcase_id: 12
+          showcase_number: 5
+          showcase_name: Пасхальные подарки
+          text: Зал 4 «Синяя гостиная», витрина 5
+          text_in: в зале 4 «Синяя гостиная», витрина 5
         hall:
-          $ref: '#/components/schemas/HallBrief'
+          id: 4
+          hall_number: 4
+          name: Синяя гостиная
         showcase:
-          $ref: '#/components/schemas/ShowcaseBrief'
+          id: 12
+          showcase_number: 5
+          name: Пасхальные подарки
+        year_created: '1899–1903'
+        origin_place: Санкт-Петербург
+        maker:
+          text: Фирма К. Фаберже, мастер М. Перхин
+          firm: Фирма К. Фаберже
+          master: мастер М. Перхин
+        master_name: Фирма К. Фаберже, мастер М. Перхин
+        material: Золото, гильоше-эмаль, бриллианты, рубины
+        techniques: гравировка, канфарение, эмаль по гильошированному фону
+        short_description: >-
+          Пасхальное яйцо-сюрприз, подаренное Николаем II императрице Александре
+          Фёдоровне в память о коронации 1896 года.
+        video_url: https://cdn.example.cloud/exhibits/coronation/video.mp4
+        model_3d_url: https://koinovo.ru/fabergemuseum/coronation
+        model_3d_embed: null
+        audio_url: null
+        source_url: https://fabergemuseum.ru/kollekczii/shedevryi-kollekczii/
 
     ExhibitListResponse:
       type: object
@@ -2961,7 +3334,7 @@ components:
         hall_id:
           type: integer
           nullable: true
-          example: 5
+          example: 4
 
     StoryRequest:
       type: object
@@ -2992,6 +3365,19 @@ components:
           maximum: 6
           default: 4
           description: Сколько вопросов-подсказок сгенерировать (по ТЗ — 3–4).
+        session_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: >-
+            Необязательный идентификатор диалога — тот же, что в `/guide/chat`.
+            Если передан, подсказки под рассказом исключают вопросы, уже
+            заданные в этой сессии, и те, на которые гид отказался отвечать.
+            Добавлено 31.08.2026 по п. II-7 («после ответа надо возвращаться
+            назад»): экран рассказа иначе снова показывает только что заданный
+            вопрос. Поле необязательное — клиенты, которые его не шлют,
+            работают как прежде.
+          example: 2f6a9b3c-1d4e-4f8a-9c2b-5e7a1d0c3b66
 
     StoryResponse:
       type: object
@@ -3012,13 +3398,27 @@ components:
           description: Сгенерированный YandexGPT рассказ.
         suggested_questions:
           type: array
-          description: 3–4 контекстных вопроса-подсказки для продолжения диалога.
+          description: >-
+            Контекстные вопросы-подсказки для продолжения диалога. Список может
+            быть КОРОЧЕ `max_questions` — это норма, а не ошибка бэкенда: с
+            31.08.2026 по просьбе музея из него снимаются формулировки вида
+            «почему выбрали именно этот материал» и «сколько времени заняло
+            создание», а также перефразировки уже предложенного вопроса
+            (`app/services/guide_style.py`). Короче он бывал и раньше — модель
+            регулярно возвращает меньше вопросов, чем у неё просят.
+
+
+            ПУСТЫМ при `max_questions > 0` не приходит: если после всех
+            исключений пул кончился, бэкенд подставляет детерминированный запас
+            по карточке. Если передан `session_id`, набор не повторяет вопросы,
+            уже заданные в этой сессии, и вопросы, на которые гид отказался
+            отвечать.
           items:
             type: string
           example:
-            - Сколько времени ушло на создание?
             - Кому подарили это яйцо?
             - Что за сюрприз спрятан внутри?
+            - Из каких материалов он сделан?
         audio_url:
           type: string
           format: uri
@@ -3067,6 +3467,14 @@ components:
             `{}` или `null` — **сброс**: контекст сессии очищается, вопрос
             трактуется как общий (вход в общий чат с главного экрана);
             заполненный объект — заменяет контекст сессии целиком.
+
+
+            ВНИМАНИЕ клиенту: если тело запроса сериализуется целиком и поле
+            уходит как `"context": null` на КАЖДОЙ реплике, это по контракту
+            означает сброс — со второй реплики гид теряет экспонат, а вместе с
+            ним и подсказки по нему. Поле надо именно ОПУСКАТЬ, а не слать со
+            значением `null`. Такой случай бэкенд с 31.08.2026 пишет в лог
+            строкой `guide_context_reset` (п. II-7).
         reset_context:
           type: boolean
           default: false
@@ -3096,7 +3504,13 @@ components:
 
     ChatResponse:
       type: object
-      required: [session_id, answer, suggested_questions]
+      # referenced_exhibits / referenced_halls объявлены обязательными
+      # осознанно: сервер отдаёт их всегда (в схеме default_factory=list,
+      # exclude_unset/exclude_none нигде не включены), а генератор клиента без
+      # required типизировал их как optional — и фронту приходилось самому
+      # защищаться от undefined. Для ОТВЕТА это ужесточение обещания сервера,
+      # обратной совместимости не ломает.
+      required: [session_id, answer, suggested_questions, referenced_exhibits, referenced_halls]
       properties:
         session_id:
           type: string
@@ -3106,21 +3520,60 @@ components:
           type: string
         suggested_questions:
           type: array
+          description: >-
+            То же, что в `StoryResponse`: список может быть короче
+            `max_questions`, потому что запрещённые музеем формулировки и
+            перефразировки снимаются на выдаче (`app/services/guide_style.py`).
+
+
+            С 31.08.2026 набор не повторяет вопросы, уже заданные в этой сессии
+            (п. II-2), и вопросы, на которые гид по этому экспонату уже
+            отказался отвечать (п. II-3, память общая для всех посетителей).
+            Поэтому после каждого ответа блок обновляется, а не показывает те же
+            первые N вопросов пула.
+
+
+            При `max_questions > 0` блок НЕ пустеет ни в одной ветке диалога
+            (п. II-7): поиск по номеру, список залов, контекст зала и общий чат
+            без контекста получают детерминированные наборы, не требующие
+            модели. Фронт может рисовать блок всегда.
+
+
+            Единственное исключение — уточняющий диалог по неуникальному номеру
+            (ответ «Экспонат №12 встречается в нескольких витринах»): там в этом
+            поле лежат не вопросы, а варианты уточнения вида «В зале 4 «Синяя
+            гостиная», витрина 5». Так было и до 31.08.2026.
           items:
             type: string
         context:
           $ref: '#/components/schemas/GuideContext'
         referenced_exhibits:
           type: array
+          default: []
           description: >-
-            Экспонаты, на которые ссылается ответ (B6/C23) — фронт рисует плашки
-            со ссылкой на карточку (компонент exhibit-plaque). Пусто, если ответ
-            ни на что конкретное не ссылается.
+            Экспонаты, реально названные в реплике (блок «Упомянуто в ответе»),
+            плюс экспонат из контекста — он в блоке всегда. Фронт рисует плашки
+            со ссылкой на карточку (компонент exhibit-plaque).
+
+
+            Порядок: сначала контекстный экспонат, затем остальные по порядку
+            упоминания в тексте; не больше четырёх. Пустой массив — законное
+            состояние: ответ не сослался ни на один предмет каталога, и блок
+            показывать не нужно (пустой блок не рисуем). Массив присутствует
+            всегда и никогда не равен null.
+
+
+            До 31.08.2026 сюда попадали первые четыре результата полнотекстового
+            поиска без порога релевантности — блок «добивался» до четырёх
+            предметами, которых в ответе нет (баг-репорт музея, п. II-1).
           items:
             $ref: '#/components/schemas/ReferencedExhibit'
         referenced_halls:
           type: array
-          description: Залы структурой (B10/C25) — когда вопрос про список залов.
+          default: []
+          description: >-
+            Залы структурой (B10/C25) — когда вопрос про список залов. Пустой
+            массив — обычное состояние; присутствует всегда, null не бывает.
           items:
             $ref: '#/components/schemas/ReferencedHall'
         location:
@@ -3152,11 +3605,28 @@ components:
         hall_number:
           type: integer
           nullable: true
-          example: 3
+          example: 4
         showcase_number:
           type: integer
           nullable: true
-          example: 2
+          example: 5
+        mentioned_in:
+          type: string
+          nullable: true
+          enum: [answer, question, context, null]
+          description: >-
+            Откуда взялась плашка (добавлено 31.08.2026, п. II-1; поле
+            необязательное — старые клиенты могут его игнорировать).
+
+
+            `answer` — предмет назван в ответе гида (заголовок «Упомянуто в
+            ответе» честен); `question` — назван только в вопросе посетителя, а
+            ответ его не повторил («где найти яйцо „Ландыши“» → «в зале 4,
+            витрина 5»), и блок уместнее озаглавить «Вы спрашивали про»;
+            `context` — экспонат, у которого стоит посетитель, он в блоке
+            всегда; `null` — плашка построена не проверкой упоминания, а точной
+            выборкой (ветки «поиск по номеру» и «список залов»).
+          example: answer
 
     ReferencedHall:
       type: object
@@ -3165,12 +3635,12 @@ components:
       properties:
         id:
           type: integer
-          example: 3
+          example: 4
         hall_number:
           type: integer
           nullable: true
           description: '`null` — зал без номера («Вне постоянной экспозиции»).'
-          example: 3
+          example: 4
         name:
           type: string
           nullable: true
@@ -3178,12 +3648,16 @@ components:
 
     GuideLocation:
       type: object
-      description: Навигационный ответ «зал + витрина» (B7).
+      description: >-
+        Навигационный ответ «зал + витрина» (B7). С 31.08.2026 рядом с числами
+        приходит и готовая фраза: `text`/`text_in` — та же формулировка, что в
+        `ExhibitLocation.text` и в тексте ответа гида (общий модуль
+        `app/services/location.py`). Склеивать её на клиенте больше не нужно.
       properties:
         hall_number:
           type: integer
           nullable: true
-          example: 3
+          example: 4
         hall_name:
           type: string
           nullable: true
@@ -3191,7 +3665,24 @@ components:
         showcase_number:
           type: integer
           nullable: true
-          example: 2
+          example: 5
+        hall_id:
+          type: integer
+          nullable: true
+          description: Для перехода в зал по ссылке.
+          example: 4
+        showcase_id:
+          type: integer
+          nullable: true
+          example: 12
+        text:
+          type: string
+          nullable: true
+          example: Зал 4 «Синяя гостиная», витрина 5
+        text_in:
+          type: string
+          nullable: true
+          example: в зале 4 «Синяя гостиная», витрина 5
 
     # ── Озвучивание ──
     SpeechVoice:
@@ -3271,7 +3762,7 @@ components:
           description: >-
             Номер зала. `null` — зал без номера («Вне постоянной экспозиции»):
             в подписях выводится только название.
-          example: 5
+          example: 4
         name:
           type: string
           nullable: true
@@ -3313,7 +3804,7 @@ components:
           description: >-
             Явный `null` убирает номер зала (зал остаётся в каталоге и
             показывается по названию).
-          example: 5
+          example: 4
         name:
           type: string
           nullable: true
@@ -3393,7 +3884,7 @@ components:
       properties:
         hall_id:
           type: integer
-          example: 5
+          example: 4
         showcase_number:
           type: integer
           nullable: true
@@ -3401,7 +3892,7 @@ components:
             Номер витрины по путеводителю. `null` — группа «не в витринах»
             (пустой квадрат в путеводителе); в зале она одна, попытка завести
             вторую → `409`.
-          example: 3
+          example: 5
         name:
           type: string
           nullable: true
@@ -3415,14 +3906,14 @@ components:
         hall_id:
           type: integer
           description: Перенести витрину в другой зал.
-          example: 5
+          example: 4
         showcase_number:
           type: integer
           nullable: true
           description: >-
             Номер витрины. Явный `null` превращает витрину в группу
             «не в витринах» (в зале допустима одна такая, иначе `409`).
-          example: 3
+          example: 5
         name:
           type: string
           nullable: true
@@ -3456,6 +3947,13 @@ components:
             валидируется. Число тоже принимается (наследие INT-типа) и
             приводится к строке.
           example: '1913'
+        origin_place:
+          type: string
+          nullable: true
+          description: >-
+            Место создания дословно как в путеводителе (п. I-2 от 31.08.2026).
+            Пусто — `null`, не пустая строка.
+          example: Санкт-Петербург
         master_name:
           type: string
           nullable: true
@@ -3509,7 +4007,12 @@ components:
     ExhibitUpdate:
       allOf:
         - $ref: '#/components/schemas/ExhibitCreate'
-      description: Полная замена полей экспоната (PUT).
+      description: >-
+        Тело PUT: набор полей тот же, что у create, семантика записи — слитная.
+        Поле, отсутствующее в теле, НЕ изменяется; явный `null` его стирает.
+        Полная замена (непереданное обнуляется) — только по `?full_replace=true`,
+        и даже она не обнуляет `image_url`: он зеркало строки галереи с
+        `is_primary` и восстанавливается из неё, пока не прислан явно.
 
     ExhibitPatch:
       type: object
@@ -3532,6 +4035,10 @@ components:
           description: >-
             Датировка как в путеводителе («1899–1903», «конец XIX века»),
             без валидации формата; число приводится к строке.
+        origin_place:
+          type: string
+          nullable: true
+          description: Место создания дословно как в путеводителе (п. I-2 от 31.08.2026).
         master_name:
           type: string
           nullable: true
@@ -3585,6 +4092,13 @@ components:
           description: >-
             Версия short_description для озвучки: числа прописью в нужном
             падеже (LLM); фронту отдаётся short_description с цифрами.
+        updated_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >-
+            Когда карточку последний раз меняли (триггер trg_exhibits_updated).
+            Только в админском представлении.
 
     MediaUploadResponse:
       type: object
@@ -3930,7 +4444,7 @@ components:
       properties:
         id:
           type: integer
-          example: 5
+          example: 4
         name:
           type: string
           nullable: true
@@ -4079,10 +4593,14 @@ components:
             type: string
         fail_reasons:
           type: object
-          description: Сколько раз сработала каждая причина отказа.
+          description: >-
+            Сколько раз сработала каждая причина: `no_context`, `llm_refusal`,
+            `llm_hedge`, `not_found`, `error`. `llm_hedge` — ответ по существу с
+            оговоркой «этого точно не знаю»; в отличие от `llm_refusal` он НЕ
+            убирает вопрос из подсказок гида.
           additionalProperties:
             type: integer
-          example: {no_context: 12, llm_refusal: 5}
+          example: {no_context: 12, llm_refusal: 5, llm_hedge: 9}
         exhibits:
           type: array
           description: >-
@@ -4138,7 +4656,12 @@ components:
           type: object
           additionalProperties:
             type: integer
-          example: {no_context: 150, llm_refusal: 40, not_found: 15, error: 5}
+          description: >-
+            Итог по причинам за период. `llm_hedge` (с 31.08.2026) — ответ по
+            существу с оговоркой; он попадает в отчёт, но не в память отказов
+            гида, то есть это сигнал «описание стоит дополнить», а не «вопрос
+            плохой».
+          example: {no_context: 150, llm_refusal: 40, llm_hedge: 60, not_found: 15, error: 5}
         items:
           type: array
           items:
@@ -4159,7 +4682,7 @@ components:
         hall_number:
           type: integer
           nullable: true
-          example: 3
+          example: 4
         views:
           type: integer
           default: 0

@@ -6,7 +6,13 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, computed_field, model_validator
+
+from .config import settings
+# Обрезка по границе предложения нужна прямо в схеме (превью описания зала).
+# Цикла импортов нет: config тянет только stdlib и pydantic_settings, а
+# text_normalize — только re/dataclasses/typing, ни БД, ни сети.
+from .services.text_normalize import shorten_to_sentence
 
 
 # Датировка экспоната — строка как в путеводителе («1899–1903», «конец XIX века»).
@@ -25,6 +31,15 @@ class HealthStatus(BaseModel):
 
 
 # ── Залы ─────────────────────────────────────────────────────────────────────
+# Ближе трети лимита граница фразы уже не считается подходящей: иначе превью
+# выродится в огрызок вроде «Зал открыт в 2013 году.» рядом с кнопкой
+# «Подробнее». Порог именно здесь, а не в настройке: музею нужен один понятный
+# рычаг «сколько текста видно», а качество разреза — наше внутреннее правило.
+# В промпте гида порог другой (0.5, дефолт shorten_to_sentence) — там цена
+# ошибки обратная, см. докстринг функции.
+_HALL_PREVIEW_MIN_RATIO = 1 / 3
+
+
 class Hall(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
@@ -40,6 +55,38 @@ class Hall(BaseModel):
     sort_order: int = 0                   # порядок вывода в каталоге/админке (drag-n-drop, C11)
     showcase_count: Optional[int] = None
     exhibit_count: Optional[int] = None
+
+    # П. I-3 баг-репорта 31.08.2026: «сократить видимую часть текста о зале,
+    # добавить опцию раскрытия полного текста». description остаётся ПОЛНЫМ и на
+    # месте — превью только добавляется, старые клиенты правки не замечают.
+    # Поля вычисляемые, а не обычные, потому что sch.Hall собирается в четырёх
+    # местах (crud.to_hall, crud.get_map, crud.get_hall и через to_hall в
+    # crud.search — три из них дублируют друг друга руками), и пятое, которое
+    # кто-нибудь допишет завтра, молча отдало бы null рядом с полным описанием.
+    # Колонки в БД тоже нет сознательно: превью — способ ПОКАЗАТЬ description, а
+    # не второй текст, который админ ведёт руками и который разъедется с
+    # описанием после первой же правки в админке.
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def description_preview(self) -> Optional[str]:
+        """Видимая часть текста о зале: начало description по границе предложения."""
+        if self.description is None:
+            return None
+        return shorten_to_sentence(
+            self.description,
+            settings.hall_description_preview_chars,
+            min_ratio=_HALL_PREVIEW_MIN_RATIO,
+        )
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def description_has_more(self) -> bool:
+        """Есть ли что раскрывать кнопкой «Подробнее о зале».
+
+        Сравниваем с ``.strip()``, потому что обрезка сама стрипает вход: иначе
+        описание с хвостовым пробелом вечно показывало бы кнопку в никуда.
+        """
+        return (self.description_preview or "") != (self.description or "").strip()
 
 
 class HallBrief(BaseModel):
@@ -64,6 +111,11 @@ class ShowcaseBrief(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
     showcase_number: Optional[int] = None
+    # Название витрины. Раньше в карточку не доезжало вовсе: музей просил «номер
+    # витрины», и краткая ссылка отдавала один номер. С 31.08.2026 расположение
+    # показывается готовой строкой, и заполнять ExhibitLocation.showcase_name
+    # без этого поля нечем.
+    name: Optional[str] = None
 
 
 class HallDetail(Hall):
@@ -108,47 +160,134 @@ class Image(BaseModel):
     is_primary: bool = False             # главная фотография экспоната (= exhibits.image_url)
 
 
+class ExhibitLocation(BaseModel):
+    """Готовое расположение предмета: и структурой, и строкой.
+
+    Музей просил расположение ГОТОВОЙ строкой (баг-репорт 31.08.2026, п. I-2):
+    сейчас фронт собирает «Зал 4 «Синяя гостиная», витрина 5» сам из трёх ручек, а
+    ИИ-гид ту же фразу печатает по-своему — и две формулировки про одно место
+    расходятся там, где это видит посетитель. Текст берётся из общего
+    `app/services/location.py`, тем же кодом, что и ответ гида.
+
+    Структура рядом со строкой нужна не для показа, а для ссылок: по `hall_id` и
+    `showcase_id` фронт делает переход в зал и в витрину, не разбирая текст обратно.
+
+    Объект ПРИСУТСТВУЕТ ВСЕГДА, даже когда предмет ни к чему не привязан: пустеет
+    он внутрь (все поля null), а не исчезновением ключа. Иначе фронт пишет три
+    уровня проверок — «ключа нет / null / пусто», — а музей просил прогнозируемости.
+    """
+
+    hall_id: Optional[int] = None
+    hall_number: Optional[int] = None      # null — зал без номера («Вне постоянной экспозиции»)
+    hall_name: Optional[str] = None
+    showcase_id: Optional[int] = None
+    showcase_number: Optional[int] = None  # null — группа «не в витринах»
+    showcase_name: Optional[str] = None
+    # «Зал 4 «Синяя гостиная», витрина 5» — строка для показа отдельной плашкой.
+    text: Optional[str] = None
+    # «в зале 4 «Синяя гостиная», витрина 5» — та же фраза для оборота
+    # «Найти его можно …»; ровно её печатает ИИ-гид.
+    text_in: Optional[str] = None
+
+
+class ExhibitMaker(BaseModel):
+    """«Фирма и мастер»: полная строка и её разобранные части.
+
+    В базе фирма и мастер лежат в ОДНОМ поле `master_name` («Фирма К. Фаберже,
+    мастер М. Перхин»), а музей просит показывать их раздельно. Колонок под них мы
+    не заводим: форму записи фирм музей оставил за собой, и два поля на одну
+    сущность расползаются при первой же правке в админке (тем же доводом убита
+    колонка-дубль `dating`, см. docs/task-2026-08-17-year-created-string.md).
+
+    Инвариант: `text` — это `master_name` дословно и ВСЕГДА авторитетен;
+    `firm`/`master` — его подстроки, разбор эвристический
+    (`catalog_line.split_maker`). Не разобралось — обе части null, а `text` на
+    месте: фронту всегда есть что нарисовать, и ошибиться он не может. Обратной
+    записи в БД у разбора нет.
+    """
+
+    text: Optional[str] = None    # = master_name дословно
+    firm: Optional[str] = None    # «Фирма К. Фаберже» — вместе со словом-маркером
+    master: Optional[str] = None  # «мастер М. Перхин»
+
+
 class ExhibitSummary(BaseModel):
+    """Краткое представление экспоната для списков, поиска и карусели.
+
+    Порядок полей — тот же, что в `Exhibit` (см. его докстринг): плашка
+    «зал/витрина» над названием рисуется одинаково и в каталоге, и в карточке.
+    """
+
     model_config = ConfigDict(from_attributes=True)
     id: int
     exhibit_number: Optional[str] = None  # номер по путеводителю музея (B3): перед названием
     label_slug: Optional[str] = None
     name: str
-    # Датировка строкой как в путеводителе («1899–1903», «конец XIX века») — её и
-    # показываем под названием. Раньше рядом жил дубль dating, а year_created был
-    # числом-огрызком (нижняя граница); с 17.08.2026 поле датировки одно.
-    year_created: YearCreated = None
-    master_name: Optional[str] = None
     thumbnail_url: Optional[str] = None
+    # Расположение готовой строкой — то же самое, что в карточке. Данных на плашку
+    # «зал/витрина» в списке раньше не было вовсе: только hall_id, без названия зала.
+    # Лишних запросов не появляется — витрина и зал уже загружены eager-ом
+    # _EXHIBIT_SUMMARY (app/crud.py).
+    location: ExhibitLocation = Field(default_factory=ExhibitLocation)
+    # Ниже — то же самое плоскими полями, как отдавалось до 31.08.2026. Не удаляем
+    # и не переименовываем: у задеплоенных клиентов на них завязана вёрстка.
     hall_id: Optional[int] = None
     showcase_id: Optional[int] = None
     # Номер витрины (null — экспонат вне витрин). Отдаём прямо в списке, чтобы
     # фронт собирал группировку «витрина → её экспонаты» из одного ответа
     # GET /halls/{id}/exhibits, без запроса на каждую витрину.
     showcase_number: Optional[int] = None
+    # Датировка строкой как в путеводителе («1899–1903», «конец XIX века») — её и
+    # показываем под названием. Раньше рядом жил дубль dating, а year_created был
+    # числом-огрызком (нижняя граница); с 17.08.2026 поле датировки одно.
+    year_created: YearCreated = None
+    maker: ExhibitMaker = Field(default_factory=ExhibitMaker)
+    master_name: Optional[str] = None    # legacy-дубль maker.text
     is_temporary: Optional[bool] = None  # унаследовано от зала: экспонат временной выставки
 
 
 class Exhibit(BaseModel):
+    """Полная карточка экспоната.
+
+    Порядок полей задан музеем дословно (баг-репорт 31.08.2026, п. I-2):
+    «название предмета, изображение, расположение (название и номер зала, номер
+    витрины), год создания, фирма и мастер, материалы, техники, описание». Pydantic
+    сохраняет порядок объявления и в JSON, и в openapi — значит порядок объявлений
+    здесь и есть контракт, а не украшение; тест на порядок полей лежит в
+    tests/test_exhibit_card.py, чтобы правка схемы не переставила его молча.
+
+    Второе требование музея — ПРОГНОЗИРУЕМОСТЬ: набор ключей постоянен, пустое
+    приходит как null, а не отсутствием ключа. Поэтому `location` и `maker` — НЕ
+    Optional: это всегда объекты, которые пустеют внутрь.
+
+    Поля `hall`, `showcase` и `master_name` дублируют содержимое `location`/`maker`
+    и оставлены для уже задеплоенных клиентов — удалять или переименовывать их нельзя.
+    """
+
     model_config = ConfigDict(from_attributes=True)
     id: int
     exhibit_number: Optional[str] = None  # номер по путеводителю музея (B3)
     label_slug: Optional[str] = None
     name: str
+    image_url: Optional[str] = None
+    images: List[Image] = Field(default_factory=list)
+    location: ExhibitLocation = Field(default_factory=ExhibitLocation)
+    hall: Optional[HallBrief] = None         # legacy-дубль location.hall_*
+    showcase: Optional[ShowcaseBrief] = None  # legacy-дубль location.showcase_*
     year_created: YearCreated = None  # датировка строкой как в путеводителе («1899–1903»)
-    master_name: Optional[str] = None
+    # Место создания рядом с датой — «Дата создания И МЕСТО» со скриншота музея.
+    # Заполняется бэкфиллом из каталожной строки; пусто — null, не пустая строка.
+    origin_place: Optional[str] = None
+    maker: ExhibitMaker = Field(default_factory=ExhibitMaker)
+    master_name: Optional[str] = None  # legacy-дубль maker.text
     material: Optional[str] = None
     techniques: Optional[str] = None  # техники из хвоста каталожной строки (после «;»)
     short_description: Optional[str] = None
-    image_url: Optional[str] = None
-    images: List[Image] = Field(default_factory=list)
     video_url: Optional[str] = None       # видео экспоната (B4/C22)
     model_3d_url: Optional[str] = None
     model_3d_embed: Optional[str] = None
     audio_url: Optional[str] = None
     source_url: Optional[str] = None
-    hall: Optional[HallBrief] = None
-    showcase: Optional[ShowcaseBrief] = None
 
 
 class ExhibitAdmin(Exhibit):
@@ -156,6 +295,10 @@ class ExhibitAdmin(Exhibit):
     # Версия short_description для озвучки: числа прописью в нужном падеже (E15).
     # Автогенерируется LLM при сохранении описания; админ может переопределить вручную.
     short_description_spoken: Optional[str] = None
+    # Когда карточку последний раз меняли (триггер trg_exhibits_updated). Отдаём
+    # только админке: без этого поля нельзя даже отсортировать каталог по времени
+    # правки и понять, какие карточки испортили сегодня, а какие месяц назад.
+    updated_at: Optional[datetime] = None
 
 
 class ExhibitListResponse(BaseModel):
@@ -214,6 +357,13 @@ class StoryRequest(BaseModel):
     language: str = "ru"
     include_audio: bool = False
     max_questions: int = Field(default=4, ge=0, le=6)
+    # Необязательный идентификатор диалога (тот же, что в /guide/chat). Если
+    # передан, подсказки под рассказом исключают вопросы, уже заданные в этой
+    # сессии, и те, на которые гид отказался отвечать. Нужно из-за дословной
+    # жалобы 31.08.2026, п. II-7: «надо возвращаться назад» — то есть на экран
+    # рассказа, где иначе снова показывается только что заданный вопрос.
+    # Старые клиенты поля не шлют, и для них ничего не меняется.
+    session_id: Optional[uuid.UUID] = None
 
 
 class StoryResponse(BaseModel):
@@ -221,6 +371,13 @@ class StoryResponse(BaseModel):
     label_slug: Optional[str] = None
     style: GuideStyle = GuideStyle.engaging
     text: str
+    # Может прийти КОРОЧЕ, чем просили в `max_questions`, и это норма, а не сбой
+    # бэкенда: с 31.08.2026 (пп. II-4/II-8) из пула снимаются формулировки,
+    # которые музей просил не предлагать, и перефразировки одного и того же
+    # вопроса (app/services/guide_style.py). Короче он бывал и раньше — модель
+    # регулярно отдаёт меньше, чем просили.
+    # ПУСТЫМ при `max_questions > 0` не приходит: если пул исчерпан исключениями,
+    # бэкенд подставляет детерминированный запас (services/guide_questions).
     suggested_questions: List[str] = Field(default_factory=list)
     audio_url: Optional[str] = None
     model: Optional[str] = None
@@ -259,6 +416,16 @@ class ReferencedExhibit(BaseModel):
     thumbnail_url: Optional[str] = None
     hall_number: Optional[int] = None
     showcase_number: Optional[int] = None
+    # Откуда взялась плашка (31.08.2026, п. II-1). Строго аддитивно: старые
+    # клиенты поля просто не видят.
+    #   answer   — предмет назван в ответе гида («Упомянуто в ответе»);
+    #   question — назван только в вопросе посетителя, ответ его не повторил
+    #              («где найти яйцо „Ландыши“» → «в зале 4, витрина 5»), фронт
+    #              может озаглавить блок «Вы спрашивали про»;
+    #   context  — экспонат, у которого посетитель стоит; он в блоке всегда;
+    #   null     — плашка построена не проверкой упоминания, а точной выборкой
+    #              (детерминированные ветки «поиск по номеру» и «список залов»).
+    mentioned_in: Optional[Literal["answer", "question", "context"]] = None
 
 
 # Структурированный зал в ответе гида (B10): «какие залы есть».
@@ -271,17 +438,43 @@ class ReferencedHall(BaseModel):
 
 # Навигационный ответ «зал + витрина» (B7): «как найти экспонат».
 class GuideLocation(BaseModel):
+    """Навигационный ответ «зал + витрина» (B7).
+
+    Порядок полей менять незачем — новые дописаны в конец. `text`/`text_in` берутся
+    из того же `app/services/location.py`, что и `ExhibitLocation.text`: до
+    31.08.2026 гид отдавал сюда одни числа, фронт склеивал фразу сам, и это было
+    третье место, где формулировка расположения могла разойтись с остальными.
+    """
+
     hall_number: Optional[int] = None
     hall_name: Optional[str] = None
     showcase_number: Optional[int] = None
+    hall_id: Optional[int] = None
+    showcase_id: Optional[int] = None
+    text: Optional[str] = None     # «Зал 4 «Синяя гостиная», витрина 5»
+    text_in: Optional[str] = None  # «в зале 4 «Синяя гостиная», витрина 5»
 
 
 class ChatResponse(BaseModel):
     session_id: uuid.UUID
     answer: str
+    # Как и в StoryResponse, может быть короче `max_questions`: запрещённые музеем
+    # формулировки и перефразировки снимаются на выдаче (services/guide_style.py).
+    # Дополнительно с 31.08.2026 (п. II-2) сюда не попадают вопросы, уже заданные
+    # в этой сессии, и (п. II-3) те, на которые гид по этому экспонату уже
+    # отказался отвечать. При `max_questions > 0` блок НЕ пустеет ни в одной
+    # ветке диалога: поиск по номеру, список залов, контекст зала и общий чат
+    # получают детерминированные наборы (см. services/guide_questions).
+    # Исключение — уточняющий диалог по неуникальному номеру (B9): там в этом
+    # поле лежат не вопросы, а варианты «В зале 4 «Синяя гостиная», витрина 5».
     suggested_questions: List[str] = Field(default_factory=list)
     context: Optional[GuideContext] = None
     # Экспонаты, на которые ссылается ответ (B6): плашки-ссылки на карточки.
+    # С 31.08.2026 (п. II-1) сюда попадают только те, чьё название или номер
+    # реально встречаются в реплике, плюс контекстный экспонат — он в блоке
+    # всегда. ПУСТОЙ СПИСОК — законное состояние, а не ошибка: значит, ответ ни
+    # на один предмет каталога не сослался, и блок «Упомянуто в ответе» рисовать
+    # не надо. Это всегда `[]`, никогда `null`.
     referenced_exhibits: List[ReferencedExhibit] = Field(default_factory=list)
     # Залы, если вопрос про список/навигацию по залам (B10).
     referenced_halls: List[ReferencedHall] = Field(default_factory=list)
@@ -409,6 +602,7 @@ class ExhibitCreate(BaseModel):
     # Датировка как в путеводителе, без валидации формата: «1899–1903» и
     # «конец XIX века» сохраняются как есть (таска 17.08.2026).
     year_created: YearCreated = None
+    origin_place: Optional[str] = None  # место создания («Санкт-Петербург»), п. I-2 от 31.08.2026
     master_name: Optional[str] = None
     material: Optional[str] = None
     techniques: Optional[str] = None
@@ -423,7 +617,21 @@ class ExhibitCreate(BaseModel):
 
 
 class ExhibitUpdate(ExhibitCreate):
-    pass
+    """Тело PUT /admin/exhibits/{id} — тот же набор полей, что у create.
+
+    Набор полей общий, а семантика записи — слитная (см. `crud.replace_exhibit`):
+    поле, отсутствующее в теле, НЕ изменяется, а явный `null` его стирает.
+    Исторически было наоборот: все необязательные поля наследуют от
+    `ExhibitCreate` дефолт `None`, `model_dump()` отдавал их скопом, и неполное
+    тело от админки обнуляло `image_url`, `short_description`, `material`,
+    `raw_history` — 31.08.2026 музей потерял так содержимое карточки, правя у неё
+    техники. Не читайте «Update = Create» как разрешение снова взять
+    `model_dump()` без `exclude_unset`.
+
+    Числа полей здесь намеренно нет: состав схемы меняется от релиза к релизу
+    (`origin_place` добавлен 31.08.2026), а устаревшая цифра в докстринге хуже её
+    отсутствия. Актуальный состав — `ExhibitUpdate.model_fields`.
+    """
 
 
 class ExhibitPatch(BaseModel):
@@ -432,6 +640,7 @@ class ExhibitPatch(BaseModel):
     label_slug: Optional[str] = None
     name: Optional[str] = None
     year_created: YearCreated = None
+    origin_place: Optional[str] = None
     master_name: Optional[str] = None
     material: Optional[str] = None
     techniques: Optional[str] = None
@@ -503,7 +712,10 @@ class AnalyticsUnansweredItem(BaseModel):
     question: str                     # представитель кластера
     count: int
     variants: List[str] = Field(default_factory=list)
-    # Сколько раз каждая причина: no_context | llm_refusal | not_found | error.
+    # Сколько раз каждая причина:
+    # no_context | llm_refusal | llm_hedge | not_found | error.
+    # `llm_hedge` (31.08.2026) — ответ по существу с оговоркой «этого точно не
+    # знаю»; в отличие от `llm_refusal` он НЕ прячет вопрос из подсказок гида.
     fail_reasons: Dict[str, int] = Field(default_factory=dict)
     # Экспонаты, у карточек которых задавали эти вопросы — там и не хватает описания.
     exhibits: List[AnalyticsTopItem] = Field(default_factory=list)

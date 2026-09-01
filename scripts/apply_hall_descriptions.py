@@ -47,18 +47,32 @@
 
 Служебные залы
 --------------
-`GET /halls` без `include_service=true` не отдаёт зал №1 «Парадная лестница» (у него
-`is_service=true` — это п.1 того же баг-репорта). Прошлая версия читала список без флага,
-поэтому лестницы для неё не существовало и её описание не залилось бы никогда. Читаем
-с `include_service=true`.
+Список читаем с `include_service=true` — но уже НЕ потому, что «Парадная лестница»
+служебная: с 31.08.2026 она обычный первый зал экспозиции (баг-репорт 31.08.2026, п. I-1,
+разбор — docs/staircase-hall-decision.md). Флаг нужен по более общей причине: список залов
+для сопоставления обязан быть ПОЛНЫМ независимо от того, помечен ли какой-то зал служебным
+сегодня. Прошлая версия читала выдачу без флага, поэтому лестницы для неё не существовало
+и её описание не залилось бы никогда; повторить эту историю с любой будущей служебной
+записью мы не хотим.
 
 Запуск
 ------
     BASE_URL=https://api.example.ru ADMIN_TOKEN=secret \\
         python scripts/apply_hall_descriptions.py                 # сухой прогон (по умолчанию)
+    ... --only "Парадная лестница"                                # только один зал (см. ниже)
     ... --report-file hall_descriptions_20260812.csv              # список замен заказчику
     ... --apply                                                   # применить
     ... --rollback hall_descriptions_rollback_20260812-120000.json --apply
+
+Ключ --only
+-----------
+Без ключа заливаются все залы файла — так и было задумано. Но на 31.08.2026 п.3 от
+12.08 на проде так и не применён: у «Белой гостиной» осталась склейка (8160 симв.), у
+«Голубой» описание пустое. Значит прогон ради одной «Парадной лестницы» (п. I-1) молча
+потянул бы за собой две чужие правки. Они верные и давно согласованные, но утверждать их
+музей должен отдельно — `--only «Парадная лестница»` даёт это сделать, ничего не ломая
+существующим вызовам. Ключ повторяемый, сравнение имён — по той же нормализации
+(`recognizer.normalize_name`), что и сопоставление с продом.
 
 Сухой прогон — ПО УМОЛЧАНИЮ: прошлая версия писала на прод, если не передан `--dry-run`,
 и одна забытая опция стоила бы четырёх перепутанных описаний. При `--apply` пишется файл
@@ -92,7 +106,8 @@ UA = "faberge-hall-descriptions/1.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 DESC_FILE = os.path.join(HERE, "..", "db", "hall_descriptions.json")
 
-# Служебные залы в список попадают только с этим флагом (см. шапку: зал №1 «Парадная лестница»).
+# Служебные записи попадают в список только с этим флагом (см. шапку «Служебные залы»):
+# сопоставлять надо с ПОЛНЫМ каталогом, иначе зал молча остаётся без описания.
 HALLS_PATH = "/halls?include_service=true"
 
 
@@ -178,6 +193,23 @@ def load_entries(path: str = DESC_FILE) -> List[Entry]:
             raise SystemExit(f"В файле описаний у ключа {key!r} нет названия зала — сопоставлять не по чему")
         entries.append(Entry(str(key), value.get("hall_number"), name, value.get("description") or ""))
     return entries
+
+
+def filter_entries(entries: Sequence[Entry], only: Optional[Sequence[str]]) -> List[Entry]:
+    """Оставить залы, названные в ``--only``. Пустой/отсутствующий ключ — оставить всё.
+
+    Имя, которого в файле нет, — это не «ничего не залилось, ну и ладно», а опечатка в
+    команде: тихо вернуть пустой план значит соврать про успех. Падаем сразу и с именами.
+    """
+    if not only:
+        return list(entries)
+    wanted = {normalize_name(name): name for name in only}
+    kept = [e for e in entries if normalize_name(e.name) in wanted]
+    missing = wanted.keys() - {normalize_name(e.name) for e in kept}
+    if missing:
+        names = ", ".join(f"«{wanted[key]}»" for key in sorted(missing))
+        raise SystemExit(f"--only: в файле описаний нет залов с именами {names}")
+    return kept
 
 
 def index_by_name(halls: Sequence[dict]) -> Dict[str, List[dict]]:
@@ -433,7 +465,12 @@ def run(args: argparse.Namespace) -> int:
     if args.rollback:
         return 1 if run_rollback(args.rollback, args.apply) else 0
 
-    plan = build_plan(load_entries(args.file), fetch_halls())
+    entries = filter_entries(load_entries(args.file), args.only)
+    if args.only:
+        # Печатаем явно: иначе «залито 1 из 12» через месяц читается как сбой скрипта,
+        # а не как сознательное ограничение прогона.
+        print("Ограничение --only: " + ", ".join(f"«{e.name}»" for e in entries) + "\n")
+    plan = build_plan(entries, fetch_halls())
     print_report(plan, args.apply)
     if args.report_file:
         write_report(plan, args.report_file)
@@ -457,6 +494,10 @@ def main() -> int:
     )
     parser.add_argument("--file", default=DESC_FILE, help="файл описаний (по умолчанию db/hall_descriptions.json)")
     parser.add_argument(
+        "--only", action="append", metavar="NAME", default=None,
+        help="залить описание только названного зала (ключ можно повторять); без ключа — все залы файла",
+    )
+    parser.add_argument(
         "--report-file", metavar="FILE",
         help="выгрузить список замен: .csv — для Excel музея, иначе JSON",
     )
@@ -468,7 +509,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.dry_run and args.apply:
         parser.error("--dry-run и --apply вместе не имеют смысла: выберите одно")
-    if args.rollback and (args.report_file or args.file != DESC_FILE):
+    if args.rollback and (args.report_file or args.only or args.file != DESC_FILE):
         parser.error("--rollback несовместим с ключами разбора файла описаний")
     return run(args)
 

@@ -1,8 +1,10 @@
-"""Юнит-тесты нормализации текста (баг-репорт 28.07.2026, п.2 и 06.08.2026, п.9).
+"""Юнит-тесты текстовых функций (баг-репорты 28.07.2026 п.2, 06.08.2026 п.9, 31.08.2026 п. I-3).
 
-Два независимых блока одного модуля:
+Три независимых блока одного модуля:
   • озвучка — числительные: «Пётр I» должен звучать как «Пётр Первый», а не «Пётр один»;
-  • типографика каталога — прямые кавычки → «ёлочки», «пресс- папье» → «пресс-папье».
+  • типографика каталога — прямые кавычки → «ёлочки», «пресс- папье» → «пресс-папье»;
+  • обрезка по границе предложения — общая для промпта диалога гида и превью
+    описания зала (переезд из `llm._shorten` 31.08.2026).
 Строки для второго блока взяты ИЗ ПРОДА (слепок каталога 06.08.2026, 1253 карточки):
 на выдуманных примерах правило легко сделать красивым и нерабочим.
 
@@ -28,6 +30,7 @@ from app.services.text_normalize import (  # noqa: E402
     normalize_for_tts,
     ordinal_word,
     roman_to_arabic,
+    shorten_to_sentence,
 )
 
 
@@ -233,6 +236,70 @@ def test_typography_and_tts_do_not_mix():
     assert fix_typography("Пётр I основал Санкт-Петербург") == "Пётр I основал Санкт-Петербург"
     assert fix_typography("XIX век") == "XIX век"
     assert normalize_for_tts('Икона "Спас Нерукотворный"') == 'Икона "Спас Нерукотворный"'
+
+
+# ── Обрезка по границе предложения (31.08.2026, п. I-3) ──────────────────────
+def test_shorten_cuts_on_sentence_boundary():
+    """Режем по концу фразы, а не по символу — на всех четырёх границах."""
+    assert shorten_to_sentence("Первое предложение. Второе предложение.", 25) == "Первое предложение."
+    assert shorten_to_sentence("Какая красота! А вот и второе предложение.", 25) == "Какая красота!"
+    assert shorten_to_sentence("Что здесь спрятано? Внутри яйца сюрприз.", 25) == "Что здесь спрятано?"
+    assert shorten_to_sentence("Материал: золото; техника — гильоше и эмаль по золоту.", 30) == (
+        "Материал: золото;"
+    )
+
+
+def test_shorten_falls_back_to_word_when_boundary_is_too_early():
+    """Граница фразы у самого начала — режем по слову и честно ставим «…».
+
+    Это и есть смысл min_ratio: для промпта гида полфразы контекста хуже, чем
+    оборванное слово, а для превью зала — наоборот, поэтому порог параметр.
+    """
+    text = "Совсем коротко. " + "длинное продолжение " * 5
+    at_half = shorten_to_sentence(text, 60)
+    assert at_half.endswith("…")
+    # Ничего не дописано: превью — честный префикс исходного текста плюс «…».
+    assert text.startswith(at_half[:-1]) and len(at_half) <= 61
+    # Тот же текст и тот же лимит, но порог ниже — теперь короткая фраза годится.
+    assert shorten_to_sentence(text, 60, min_ratio=1 / 5) == "Совсем коротко."
+
+
+def test_shorten_default_ratio_repeats_previous_prompt_behaviour():
+    """Дефолт 0.5 — ровно прежний порог `cut >= limit // 2` из `llm._shorten`.
+
+    Обрезка справки уходит в оплачиваемый промпт диалога, и переезд функции не
+    должен был изменить ни одного знака в нём.
+    """
+    for limit in range(1, 1000):
+        assert int(limit * 0.5) == limit // 2, limit
+
+
+def test_shorten_short_text_is_returned_whole():
+    assert shorten_to_sentence("Короткий текст.", 100) == "Короткий текст."
+    # Вход стрипается: описание с хвостовым пробелом не должно считаться длиннее.
+    assert shorten_to_sentence("  Короткий текст.  ", 100) == "Короткий текст."
+
+
+def test_shorten_empty_text():
+    assert shorten_to_sentence("", 10) == ""
+    assert shorten_to_sentence(None, 10) == ""
+    assert shorten_to_sentence("   ", 10) == ""
+
+
+def test_shorten_zero_limit_disables_cutting():
+    """`limit <= 0` — обрезка выключена: текст отдаётся целиком, без «…»."""
+    text = "Первое предложение. Второе предложение."
+    assert shorten_to_sentence(text, 0) == text
+    assert shorten_to_sentence(text, -100) == text
+
+
+def test_llm_shorten_is_the_same_function():
+    """`llm._shorten` остался алиасом — иначе разъедутся промпт и превью зала."""
+    try:
+        from app.services import llm
+    except ImportError:  # standalone-прогон без httpx — проверять нечего
+        return
+    assert llm._shorten is shorten_to_sentence
 
 
 if __name__ == "__main__":

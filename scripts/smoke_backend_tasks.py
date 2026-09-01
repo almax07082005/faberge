@@ -158,6 +158,10 @@ def main() -> int:
               all(k in rex for k in ("id", "name", "thumbnail_url", "hall_number", "showcase_number")), str(rex))
 
     # ── B6: обычный вопрос с ключевым словом → плашка найденного экспоната ──
+    # С 31.08.2026 (п. II-1) в блок попадают только предметы, реально названные в
+    # реплике: раньше он добивался до четырёх результатами поиска без порога.
+    # Проверка проходит потому, что название есть в САМОМ ВОПРОСЕ, а
+    # guide_mentions откатывается к вопросу, когда ответ никого не назвал.
     r = c.post("/guide/chat", json={"message": "расскажи про Коронационное яйцо"})
     g = r.json()
     check("B6 keyword question → referenced_exhibits", len(g.get("referenced_exhibits", [])) >= 1,

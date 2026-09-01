@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
 """Чистка каталога залов по баг-репорту заказчика от 28.07.2026 (п.5).
 
-Что делает (ровно то, что просил заказчик):
+Что делает:
 
-  1. «Парадная лестница» — убирается из списка залов. По умолчанию помечается
-     служебной (``is_service = true``): запись и её описание остаются в каталоге
-     и доступны по прямой ссылке, но в ``GET /halls``, на карте и в ответах гида
-     она не появляется. С ключом ``--delete-staircase`` запись удаляется совсем —
-     привязанные экспонаты перед этим переносятся (см. п.3).
+  1. «Парадная лестница» — НИЧЕГО, если не попросить явно. Пункт 5 от 28.07.2026
+     («убрать Парадную лестницу из списка залов») ОТМЕНЁН музеем 31.08.2026:
+     п. I-1 нового баг-репорта — «Во вкладке "Основная экспозиция" добавить первым
+     залом "Парадная лестница" с рассказом о дворце и истории создания Музея».
+     Разбор обоих решений — docs/staircase-hall-decision.md.
+     Ключ ``--hide-staircase`` возвращает старое поведение (пометить служебной,
+     ``is_service = true``), ``--delete-staircase`` — удалить запись совсем
+     (привязанные экспонаты перед этим переносятся, см. п.3).
   2. «Вне постоянной экспозиции» (зал № 99) — остаётся, но БЕЗ номера:
      ``hall_number = NULL``. Подписи и ответы гида перестают говорить «зал 99».
   3. «Название потом придумаем» (зал № 100) — тестовая запись, удаляется.
      Если к ней привязаны экспонаты, они сначала переносятся в зал «Вне
      постоянной экспозиции», в группу «не в витринах» (``showcase_number IS
      NULL``) — чтобы ни один экспонат не остался привязан к удалённой записи.
+
+Почему шаг 1 стал опт-ин, а не удалён вместе с пунктом
+------------------------------------------------------
+Пункты 2 и 3 живые, и ради них скрипт зовут до сих пор (README, раздел «Каталог
+залов и витрин»). Пока шаг с лестницей оставался поведением по умолчанию, любой
+такой прогон третьим действием молча возвращал ``is_service = true`` и отменял
+решение музея от 31.08.2026 — самый вероятный путь регресса по п. I-1. Удалять
+шаг целиком тоже нельзя: механизм скрытия остаётся в контракте, и он ещё
+понадобится для настоящих служебных записей.
 
 Требует применённой миграции db/migrations/2026-07-29_bugreport_catalog.sql
 (nullable hall_number/showcase_number, колонка is_service).
@@ -22,7 +34,8 @@
 прогон, который только печатает план.
 
     python scripts/cleanup_hall_catalog.py               # показать план
-    python scripts/cleanup_hall_catalog.py --apply       # применить
+    python scripts/cleanup_hall_catalog.py --apply       # применить (лестницу НЕ трогает)
+    python scripts/cleanup_hall_catalog.py --apply --hide-staircase
     python scripts/cleanup_hall_catalog.py --apply --delete-staircase
 
 Env: DATABASE_URL (как у остальных скриптов), опционально DB_SSL_ROOT_CERT.
@@ -97,7 +110,7 @@ async def _move_exhibits(conn: asyncpg.Connection, src_hall: int, dst_hall: int,
     return count
 
 
-async def _run(apply: bool, delete_staircase: bool) -> int:
+async def _run(apply: bool, delete_staircase: bool, hide_staircase: bool = False) -> int:
     ca = os.environ.get("DB_SSL_ROOT_CERT")
     conn = await asyncpg.connect(_dsn(), ssl=ssl.create_default_context(cafile=ca) if ca else None)
     plan: list[str] = []
@@ -125,6 +138,15 @@ async def _run(apply: bool, delete_staircase: bool) -> int:
                 plan.append(
                     f"— «{stairs['name']}» (id={stairs['id']}): УДАЛИТЬ"
                     + (f", предварительно перенести экспонатов: {moved}" if moved else "")
+                )
+            elif not hide_staircase:
+                # Дефолт с 31.08.2026: зал публичный по решению музея (п. I-1).
+                # Молча ставить флаг обратно нельзя — прогон ради пунктов 2 и 3
+                # отменял бы решение заказчика (см. шапку).
+                plan.append(
+                    f"— «{stairs['name']}»: пропускаю, с 31.08.2026 зал публичный по решению "
+                    f"музея (см. docs/staircase-hall-decision.md). Спрятать всё же нужно — "
+                    f"добавьте --hide-staircase"
                 )
             elif stairs["is_service"]:
                 plan.append(f"— «{stairs['name']}»: уже служебная, ничего не делаю")
@@ -194,15 +216,29 @@ class _DryRun(Exception):
     """Служебное исключение: откатить транзакцию сухого прогона."""
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Парсер отдельной функцией — чтобы дефолты проверялись тестом без БД.
+
+    Проверяется ровно одно и очень конкретное свойство: пустой argv НЕ включает
+    шаг с лестницей. Это и есть защита от регресса по п. I-1.
+    """
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--apply", action="store_true", help="применить изменения (без ключа — сухой прогон)")
+    parser.add_argument(
+        "--hide-staircase", action="store_true",
+        help="пометить «Парадную лестницу» служебной (is_service = true) — поведение до 31.08.2026; "
+             "по умолчанию зал не трогаем, музей отменил п.5 от 28.07.2026",
+    )
     parser.add_argument(
         "--delete-staircase", action="store_true",
         help="удалить «Парадную лестницу» вместо пометки служебной (экспонаты переносятся)",
     )
-    args = parser.parse_args()
-    return asyncio.run(_run(args.apply, args.delete_staircase))
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    return asyncio.run(_run(args.apply, args.delete_staircase, args.hide_staircase))
 
 
 if __name__ == "__main__":

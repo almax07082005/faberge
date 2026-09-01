@@ -14,9 +14,19 @@
 
 Как размечает:
   • ответ содержит маркер отказа (app/services/guide_intel.is_refusal) →
-    answered = false; причина `no_context`, если у сессии не было контекста
-    экспоната/зала, иначе `llm_refusal`;
+    answered = false;
+  • причина зависит от того, отказ это ЦЕЛИКОМ или оговорка в содержательном
+    ответе (app/services/guide_intel.is_hard_refusal): отказ целиком →
+    `no_context`, если у сессии не было контекста экспоната/зала, иначе
+    `llm_refusal`; оговорка → `llm_hedge`;
   • иначе → answered = true.
+
+Разделение причин обязательно, а не «для красоты отчёта»: `llm_refusal` и
+`no_context` кормят глобальную память отказов (app/crud.py:
+exhibit_refused_questions), то есть вопрос с такой причиной перестаёт
+предлагаться ВСЕМ посетителям экспоната. Разметить широким признаком весь
+исторический хвост — значит одним прогоном спрятать из подсказок сотни
+нормальных вопросов, у которых модель просто оговорилась в середине ответа.
 Признак пишется на ОБЕ строки пары (вопрос посетителя и ответ гида) — так же,
 как это делает рантайм.
 
@@ -42,7 +52,7 @@ import asyncpg
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.services.guide_intel import is_refusal  # noqa: E402
+from app.services.guide_intel import is_hard_refusal, is_refusal  # noqa: E402
 
 
 def _dsn() -> str:
@@ -80,17 +90,25 @@ async def _run(apply: bool) -> None:
         rows = await conn.fetch(_PAIRS_SQL)
         updates: list[tuple[int, int, bool, str | None]] = []
         for row in rows:
-            refused = is_refusal(row["answer"] or "")
+            answer = row["answer"] or ""
+            refused = is_refusal(answer)
             reason = None
             if refused:
-                # Контекст сессии — единственный след того, была ли у гида справка.
-                has_context = bool(row["context"]) and row["context"] not in ("{}", "null")
-                reason = "llm_refusal" if has_context else "no_context"
+                if is_hard_refusal(answer):
+                    # Контекст сессии — единственный след того, была ли у гида справка.
+                    has_context = bool(row["context"]) and row["context"] not in ("{}", "null")
+                    reason = "llm_refusal" if has_context else "no_context"
+                else:
+                    # Ответ по существу, в котором модель оговорилась. В отчёт —
+                    # да, в память отказов — нет (см. шапку файла).
+                    reason = "llm_hedge"
             updates.append((row["question_id"], row["answer_id"], not refused, reason))
 
         unanswered = sum(1 for *_rest, answered, _reason in updates if not answered)
+        hedges = sum(1 for *_rest, reason in updates if reason == "llm_hedge")
         print(f"пар «вопрос — ответ» без признака: {len(updates)}")
         print(f"будет размечено как отказ: {unanswered}")
+        print(f"  из них оговорок (llm_hedge, в память отказов НЕ идут): {hedges}")
         if not apply:
             print("сухой прогон — ничего не изменено (--apply, чтобы применить)")
             return

@@ -12,6 +12,10 @@
          экспонаты» собирается из GET /halls/{id}/exhibits;
   п.5  — служебные залы скрыты из GET /halls, зал без номера отдаётся с
          hall_number = null, гид считает только пронумерованные залы.
+         ЧАСТИЧНО ОТМЕНЁН: конкретное требование «убрать Парадную лестницу из
+         списка залов» музей отменил 31.08.2026 (п. I-1), поэтому проверка по
+         лестнице здесь обратная — зал обязан быть в GET /halls и стоять первым.
+         Механизм служебных записей отменён не был и проверяется как раньше.
 
 Гоняет реальные HTTP-запросы к запущенному API с применённой схемой + seed:
 
@@ -84,9 +88,21 @@ def main() -> int:
               with_service["total"] >= halls["total"], f"{halls['total']} vs {with_service['total']}")
         check("п.5 в публичной выдаче нет служебных залов",
               all(not h.get("is_service") for h in halls["items"]))
-        check("п.5 Парадной лестницы нет в списке залов",
-              not any((h.get("name") or "").strip().lower() == "парадная лестница" for h in halls["items"]),
-              str([h.get("name") for h in halls["items"]]))
+        # Третья проверка — обратная той, что стояла здесь до 31.08.2026. Пункт 5
+        # («убрать Парадную лестницу из списка залов») музей ОТМЕНИЛ баг-репортом
+        # 31.08.2026, п. I-1: «добавить первым залом "Парадная лестница"». Две
+        # проверки выше про механизм и остаются верными, а эта была про решение —
+        # см. docs/staircase-hall-decision.md, раздел «Отменено 31.08.2026».
+        # На демо-сиде db/seed.sql такого зала нет вовсе: тогда проверять нечего и
+        # мы её тихо пропускаем, а не валим прогон на отсутствующих данных.
+        def _is_staircase(h: dict) -> bool:
+            return (h.get("name") or "").strip().lower() == "парадная лестница"
+
+        if any(_is_staircase(h) for h in with_service["items"]):
+            numbered = [h for h in halls["items"] if h.get("hall_number") is not None]
+            check("I-1 «Парадная лестница» в списке залов и первая по порядку",
+                  bool(numbered) and _is_staircase(numbered[0]),
+                  str([h.get("name") for h in halls["items"]]))
 
         # Зал без номера отдаётся с hall_number = null и не ломает подписи гида.
         hall = c.post("/admin/halls", headers=auth,

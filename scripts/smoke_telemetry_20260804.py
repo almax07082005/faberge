@@ -6,8 +6,11 @@
   §1  `props.retry` у `recognition` проходит белый список и доезжает до БД,
       а прочие ключи вне контракта по-прежнему отбрасываются;
   §2  каталог залов почищен (`scripts/cleanup_hall_catalog.py --apply`):
-      «Парадная лестница» служебная, «Вне постоянной экспозиции» без номера,
-      тестового зала «Название потом придумаем» нет.
+      «Вне постоянной экспозиции» без номера, тестового зала «Название потом
+      придумаем» нет. Проверка по «Парадной лестнице» сверяется с состоянием
+      ПОСЛЕ отмены решения 31.08.2026 (п. I-1): зал публичный, стоит первым и
+      служебным больше не помечен. До 31.08.2026 здесь проверялось обратное —
+      разбор обоих решений в docs/staircase-hall-decision.md.
 
 Проверка §1 опирается на то, что «одинокое» успешное распознавание с
 `retry: true` эвристикой не считается повтором — если `retry_after_fail`
@@ -146,13 +149,18 @@ def check_hall_catalog() -> None:
     full_items = full["items"]
     by_name = {h["name"].strip(): h for h in full_items}
 
-    check(all(h["name"].strip() != STAIRCASE for h in public_items),
-          "§2 «Парадной лестницы» нет в GET /halls",
+    # Обе проверки по лестнице инвертированы 31.08.2026: п.5 от 28.07.2026 отменён
+    # п. I-1 («добавить первым залом "Парадная лестница"»). Зал должен быть в
+    # публичной выдаче, не быть служебным и стоять ПЕРВЫМ среди пронумерованных —
+    # это и есть то, что музей увидит в приложении.
+    numbered_public = [h for h in public_items if h.get("hall_number") is not None]
+    check(bool(numbered_public) and numbered_public[0]["name"].strip() == STAIRCASE,
+          "§2 «Парадная лестница» первая в GET /halls",
           ", ".join(h["name"] for h in public_items))
 
     stairs = by_name.get(STAIRCASE)
-    check(stairs is not None and stairs.get("is_service") is True,
-          "§2 «Парадная лестница» есть в include_service=true с is_service: true",
+    check(stairs is not None and stairs.get("is_service") is False,
+          "§2 «Парадная лестница» больше не служебная (is_service: false)",
           json.dumps(stairs, ensure_ascii=False))
 
     outside = by_name.get(OUTSIDE_EXPO)

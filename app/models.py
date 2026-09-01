@@ -56,8 +56,13 @@ class Hall(Base):
     level: Mapped[Optional[int]] = mapped_column(Integer)
     cover_image_url: Mapped[Optional[str]] = mapped_column(Text)
     is_temporary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    # Служебная запись (Парадная лестница, технические залы): хранится в каталоге,
-    # но не показывается посетителю — ни в GET /halls, ни на карте, ни в ответах гида.
+    # Служебная запись каталога (технические залы, вспомогательные пространства):
+    # хранится в каталоге, но не показывается посетителю — ни в GET /halls, ни на
+    # карте, ни в ответах гида.
+    # «Парадная лестница» была такой записью с 29.07 по 31.08.2026 (п.5 баг-репорта
+    # 28.07.2026); музей это решение отменил, зал снова публичный — разбор и отмена
+    # в docs/staircase-hall-decision.md. Механизм остаётся: сегодня служебных
+    # записей в каталоге нет ни одной, но для будущих он нужен.
     is_service: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -109,6 +114,12 @@ class Exhibit(Base):
     # «конец XIX — начало XX века». До 17.08.2026 поле было INT (нижняя граница
     # диапазона) и жило в паре с dating; теперь поле датировки одно (таска 17.08.2026).
     year_created: Mapped[Optional[str]] = mapped_column(Text)
+    # Место создания дословно как в путеводителе: «Санкт-Петербург», «Швейцария,
+    # Женева», «Московская губерния, Дмитровский уезд, село Горбуново». Колонку
+    # завели 31.08.2026: музей просит показывать «дату создания И МЕСТО» рядом, а
+    # парсер каталожной строки место извлекал давно (catalog_line.ParsedLine.
+    # origin_place) — складывать его было некуда, и оно уходило только в отчёт.
+    origin_place: Mapped[Optional[str]] = mapped_column(Text)
     master_name: Mapped[Optional[str]] = mapped_column(String(255))
     material: Mapped[Optional[str]] = mapped_column(String(255))
     # Техники из хвоста каталожной строки (после «;») — отдельно от материалов.
@@ -191,7 +202,8 @@ class GuideMessage(Base):
     __table_args__ = (
         CheckConstraint("role IN ('user','assistant','system')", name="guide_messages_role_chk"),
         CheckConstraint(
-            "fail_reason IS NULL OR fail_reason IN ('no_context','llm_refusal','not_found','error')",
+            "fail_reason IS NULL OR fail_reason IN "
+            "('no_context','llm_refusal','llm_hedge','not_found','error')",
             name="guide_messages_fail_reason_chk",
         ),
     )
@@ -209,6 +221,11 @@ class GuideMessage(Base):
     # Пишется на ОБЕ строки пары (вопрос и ответ): отчёт «вопросы без ответа»
     # читает role='user' без self-join.
     answered: Mapped[Optional[bool]] = mapped_column(Boolean)
+    # Причина неудачи. Две из пяти — 'llm_refusal' и 'no_context' — кормят не
+    # только отчёт, но и глобальную память отказов (`crud.exhibit_refused_questions`,
+    # решение Д8): вопрос с такой причиной перестаёт предлагаться ВСЕМ посетителям
+    # экспоната. Поэтому содержательный ответ с оговоркой «этого точно не знаю»
+    # получает отдельную причину 'llm_hedge' — она в ту выборку не входит.
     fail_reason: Mapped[Optional[str]] = mapped_column(String(32))
     # Контекст вопроса — у какого экспоната/зала спрашивали (для привязки отчёта).
     exhibit_id: Mapped[Optional[int]] = mapped_column(Integer)
